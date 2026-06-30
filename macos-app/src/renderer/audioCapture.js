@@ -20,6 +20,11 @@ let mediaStream = null;
 let workletNode = null;
 let sourceNode = null;
 let isCapturing = false;
+// One-shot guard so the "first chunk" stage log fires once per capture, not
+// every audio frame (see Log-driven-development in CLAUDE.md). The
+// authoritative per-stage trace lives in the main process (lib/timing.js);
+// these renderer logs just make the capture stage self-documenting.
+let loggedFirstChunk = false;
 
 /**
  * Minimal linear-interpolation resampler. Mic input usually arrives at
@@ -75,6 +80,10 @@ async function startCapture() {
     if (event.data.type !== 'audio') return;
     const resampled = resampleFloat32(event.data.samples, audioContext.sampleRate, TARGET_SAMPLE_RATE);
     const int16 = float32ToInt16(resampled);
+    if (!loggedFirstChunk) {
+      loggedFirstChunk = true;
+      console.log('[latency] capture: first audio chunk forwarded to main', Date.now());
+    }
     // Forward to the main process for Opus encoding + websocket send. See
     // preload.js for the contextBridge surface (`window.flowLocal.sendAudioChunk`).
     window.flowLocal.sendAudioChunk(int16.buffer);
@@ -85,6 +94,7 @@ async function startCapture() {
   // we don't want to play the mic input back out of the speakers.
 
   isCapturing = true;
+  console.log('[latency] capture: mic capture started', Date.now());
 }
 
 function stopCapture() {
@@ -100,6 +110,7 @@ function stopCapture() {
   mediaStream = null;
   audioContext = null;
   isCapturing = false;
+  loggedFirstChunk = false;
 }
 
 // main.js tells this renderer when the hotkey is pressed/released via IPC,

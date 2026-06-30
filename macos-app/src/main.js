@@ -18,6 +18,7 @@ const { Hotkey } = require('./lib/hotkey');
 const { DictationConnection } = require('./lib/wsClient');
 const { replaceCurrentTextViaClipboardPaste, typeIncrementalDelta } = require('./lib/textInject');
 const { recordIfCorrection, getLearnedTerms, recordSession } = require('./lib/corrections');
+const { DictationTimer } = require('./lib/timing');
 
 // --- Configuration ---
 // In a real build, surface these in a settings window rather than hardcoding.
@@ -34,7 +35,7 @@ let captureWindow = null; // hidden window that runs renderer/audioCapture.js
 let hotkey = null;
 
 let currentConnection = null;
-let dictationStartTime = null;
+let currentTimer = null; // per-stage latency trace for the in-flight dictation (see lib/timing.js)
 let lastInjectedText = ''; // tracks live partial text WITHIN the current dictation only
 let lastCompletedPolishedText = ''; // the polished result of the most recently FINISHED dictation, used for cross-dictation correction detection
 let lastPolishedAt = 0;
@@ -70,7 +71,9 @@ async function requestPermissions() {
 }
 
 function startDictation() {
-  dictationStartTime = Date.now();
+  // Starts the per-stage latency trace; the constructor stamps hotkeyDown
+  // (≈ mic-start) immediately. See lib/timing.js.
+  currentTimer = new DictationTimer();
   lastInjectedText = '';
 
   // Personal-dictionary learning loop (see CLAUDE.md Decisions section 5 /
@@ -84,6 +87,7 @@ function startDictation() {
   currentConnection = new DictationConnection(JETSON_URL, SHARED_SECRET, knownTerms);
 
   currentConnection.on('partial', ({ text, isFinal }) => {
+    if (currentTimer) currentTimer.markOnce('firstPartial');
     // Live partial injection: type only the delta since the last update,
     // via synthetic keystrokes — NOT clipboard-paste, per CLAUDE.md
     // Decisions section 2. The final polished replace (below, on
@@ -104,8 +108,12 @@ function startDictation() {
     lastInjectedText = text;
   });
 
-  currentConnection.on('polished', ({ rawText, polishedText }) => {
-    const releaseToTextLatencyMs = Date.now() - dictationStartTime;
+  currentConnection.on('polished', ({ rawText, polishedText, timings }) => {
+    // `timings` is the Jetson-measured { asrFinalizeMs, gemmaMs } durations,
+    // present once the server side reports them (see wsClient.js); harmless
+    // and null-valued until then.
+    const timer = currentTimer;
+    if (timer) timer.markOnce('polishedReceived');
 
     if (!polishedText) {
       // No speech detected (very short utterance) — per the spec's
@@ -118,8 +126,15 @@ function startDictation() {
 
     replaceCurrentTextViaClipboardPaste(polishedText)
       .then(() => {
+        if (timer) timer.markOnce('pasteDone');
         const now = Date.now();
         const msSinceLast = now - lastPolishedAt;
+
+        // Per-stage latency trace (see lib/timing.js / master-plan §4). Log
+        // it every dictation so a regression is visible from the first run,
+        // and persist the breakdown alongside the session metrics.
+        const t = timer ? timer.summary(timings || {}) : {};
+        if (timer) console.log(timer.logLine(timings || {}));
 
         // Check whether this dictation looks like a correction of the
         // immediately-previous one, and log it to the learning store if so.
@@ -138,8 +153,13 @@ function startDictation() {
         recordSession({
           rawWordCount: rawText.trim().split(/\s+/).filter(Boolean).length,
           polishedWordCount: polishedText.trim().split(/\s+/).filter(Boolean).length,
-          speakingDurationMs: null, // TODO: track actual hotkey-down duration separately from total latency
-          releaseToTextLatencyMs,
+          speakingDurationMs: t.speakingDurationMs ?? null,
+          releaseToTextLatencyMs: t.releaseToTextMs ?? null,
+          timeToFirstPartialMs: t.timeToFirstPartialMs ?? null,
+          releaseToPolishedMs: t.releaseToPolishedMs ?? null,
+          pasteMs: t.pasteMs ?? null,
+          asrFinalizeMs: t.asrFinalizeMs ?? null,
+          gemmaMs: t.gemmaMs ?? null,
           asrPath: 'B', // Path B per CLAUDE.md architecture decision
           appBundleId: lastFrontmostAppBundleId,
           hadFollowupCorrection: Boolean(diff),
@@ -176,6 +196,9 @@ function startDictation() {
 }
 
 function endDictation() {
+  // end-of-speech: stamp it before signalling the server so the
+  // release→polished and release→text deltas measure from the true release.
+  if (currentTimer) currentTimer.markOnce('hotkeyUp');
   if (currentConnection) {
     currentConnection.endUtterance();
   }
@@ -212,6 +235,9 @@ app.whenReady().then(async () => {
 
 ipcMain.on('audio-chunk', (event, arrayBuffer) => {
   if (currentConnection) {
+    // First chunk reaching the main process ≈ "audio is flowing" — the
+    // anchor for the time-to-first-partial responsiveness metric.
+    if (currentTimer) currentTimer.markOnce('firstChunkSent');
     currentConnection.sendAudioChunk(Buffer.from(arrayBuffer));
   }
 });

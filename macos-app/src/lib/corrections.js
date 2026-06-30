@@ -48,6 +48,11 @@ function getDb() {
       polished_word_count INTEGER,
       speaking_duration_ms INTEGER,
       release_to_text_latency_ms INTEGER,
+      time_to_first_partial_ms INTEGER,
+      release_to_polished_ms INTEGER,
+      paste_ms INTEGER,
+      asr_finalize_ms INTEGER,
+      gemma_ms INTEGER,
       asr_path TEXT,
       app_bundle_id TEXT,
       had_followup_correction INTEGER DEFAULT 0
@@ -57,7 +62,34 @@ function getDb() {
     CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at);
   `);
 
+  migrateSessionsColumns(db);
+
   return db;
+}
+
+/**
+ * Additive schema migration for the per-stage latency columns (master-plan
+ * §4 instrumentation). A DB created before these columns existed won't have
+ * them, and `CREATE TABLE IF NOT EXISTS` won't add them to an existing table
+ * — so add each missing column idempotently. SQLite has no `ADD COLUMN IF
+ * NOT EXISTS`, hence the table_info check.
+ */
+function migrateSessionsColumns(database) {
+  const existing = new Set(
+    database.prepare(`PRAGMA table_info(sessions)`).all().map((c) => c.name)
+  );
+  const wanted = [
+    'time_to_first_partial_ms',
+    'release_to_polished_ms',
+    'paste_ms',
+    'asr_finalize_ms',
+    'gemma_ms',
+  ];
+  for (const col of wanted) {
+    if (!existing.has(col)) {
+      database.exec(`ALTER TABLE sessions ADD COLUMN ${col} INTEGER`);
+    }
+  }
 }
 
 /**
@@ -181,6 +213,11 @@ function recordSession({
   polishedWordCount,
   speakingDurationMs,
   releaseToTextLatencyMs,
+  timeToFirstPartialMs = null,
+  releaseToPolishedMs = null,
+  pasteMs = null,
+  asrFinalizeMs = null,
+  gemmaMs = null,
   asrPath,
   appBundleId,
   hadFollowupCorrection,
@@ -190,8 +227,9 @@ function recordSession({
     .prepare(
       `INSERT INTO sessions
        (created_at, raw_word_count, polished_word_count, speaking_duration_ms,
-        release_to_text_latency_ms, asr_path, app_bundle_id, had_followup_correction)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        release_to_text_latency_ms, time_to_first_partial_ms, release_to_polished_ms,
+        paste_ms, asr_finalize_ms, gemma_ms, asr_path, app_bundle_id, had_followup_correction)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       Date.now(),
@@ -199,6 +237,11 @@ function recordSession({
       polishedWordCount,
       speakingDurationMs,
       releaseToTextLatencyMs,
+      timeToFirstPartialMs,
+      releaseToPolishedMs,
+      pasteMs,
+      asrFinalizeMs,
+      gemmaMs,
       asrPath,
       appBundleId || null,
       hadFollowupCorrection ? 1 : 0
