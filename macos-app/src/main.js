@@ -16,8 +16,14 @@ const path = require('path');
 
 const { Hotkey } = require('./lib/hotkey');
 const { DictationConnection } = require('./lib/wsClient');
-const { replaceCurrentTextViaClipboardPaste, typeIncrementalDelta } = require('./lib/textInject');
+const {
+  replaceCurrentTextViaClipboardPaste,
+  typeIncrementalDelta,
+  getFrontmostAppBundleId,
+} = require('./lib/textInject');
 const { recordIfCorrection, getLearnedTerms, recordSession } = require('./lib/corrections');
+const { DictationTimer } = require('./lib/timing');
+const { getMetrics } = require('./lib/metrics');
 
 // --- Configuration ---
 // In a real build, surface these in a settings window rather than hardcoding.
@@ -31,14 +37,15 @@ const SHARED_SECRET = process.env.YAPFLOW_SECRET || null; // must match jetson-s
 
 let tray = null;
 let captureWindow = null; // hidden window that runs renderer/audioCapture.js
+let dashboardWindow = null; // metrics dashboard, opened on demand from the tray
 let hotkey = null;
 
 let currentConnection = null;
-let dictationStartTime = null;
+let currentTimer = null; // per-stage latency trace for the in-flight dictation (see lib/timing.js)
 let lastInjectedText = ''; // tracks live partial text WITHIN the current dictation only
 let lastCompletedPolishedText = ''; // the polished result of the most recently FINISHED dictation, used for cross-dictation correction detection
 let lastPolishedAt = 0;
-let lastFrontmostAppBundleId = null; // TODO: populate via a frontmost-app helper if needed for per-app personalization
+let lastFrontmostAppBundleId = null; // bundle id of the app being dictated into; refreshed per dictation (see startDictation)
 
 function createCaptureWindow() {
   // Hidden, never shown — exists purely to host the renderer-side
@@ -56,6 +63,32 @@ function createCaptureWindow() {
   captureWindow.loadFile(path.join(__dirname, 'renderer', 'capture.html'));
 }
 
+function openDashboard() {
+  // Occasionally-opened metrics window, kept off the always-running surface
+  // (see CLAUDE.md "keep the always-running surface area minimal"). Reuse the
+  // window if it's already open rather than stacking duplicates.
+  if (dashboardWindow && !dashboardWindow.isDestroyed()) {
+    dashboardWindow.show();
+    dashboardWindow.focus();
+    return;
+  }
+  dashboardWindow = new BrowserWindow({
+    width: 960,
+    height: 800,
+    title: 'Yapflow — Metrics',
+    show: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'dashboard', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  dashboardWindow.loadFile(path.join(__dirname, 'dashboard', 'index.html'));
+  dashboardWindow.on('closed', () => {
+    dashboardWindow = null;
+  });
+}
+
 async function requestPermissions() {
   // Microphone permission is requested implicitly by getUserMedia in the
   // renderer the first time it's called. Accessibility permission (needed
@@ -70,8 +103,23 @@ async function requestPermissions() {
 }
 
 function startDictation() {
-  dictationStartTime = Date.now();
+  // Starts the per-stage latency trace; the constructor stamps hotkeyDown
+  // (≈ mic-start) immediately. See lib/timing.js.
+  currentTimer = new DictationTimer();
   lastInjectedText = '';
+
+  // Capture which app we're dictating into, for per-app metrics and
+  // personalization. Read asynchronously so we don't add a process-spawn to
+  // the hotkey-down hot path — it resolves long before the session is
+  // recorded (on 'polished'). The knownTerms lookup below may use the prior
+  // value; getLearnedTerms tolerates that (it always includes app-agnostic
+  // terms too), so the only cost is a marginally-less-targeted term list on
+  // the very first dictation into a newly-focused app.
+  getFrontmostAppBundleId()
+    .then((id) => {
+      lastFrontmostAppBundleId = id;
+    })
+    .catch(() => {});
 
   // Personal-dictionary learning loop (see CLAUDE.md Decisions section 5 /
   // docs/yapflow-master-plan.md Section 3.3): pull the locally-learned
@@ -84,6 +132,7 @@ function startDictation() {
   currentConnection = new DictationConnection(JETSON_URL, SHARED_SECRET, knownTerms);
 
   currentConnection.on('partial', ({ text, isFinal }) => {
+    if (currentTimer) currentTimer.markOnce('firstPartial');
     // Live partial injection: type only the delta since the last update,
     // via synthetic keystrokes — NOT clipboard-paste, per CLAUDE.md
     // Decisions section 2. The final polished replace (below, on
@@ -104,8 +153,12 @@ function startDictation() {
     lastInjectedText = text;
   });
 
-  currentConnection.on('polished', ({ rawText, polishedText }) => {
-    const releaseToTextLatencyMs = Date.now() - dictationStartTime;
+  currentConnection.on('polished', ({ rawText, polishedText, timings }) => {
+    // `timings` is the Jetson-measured { asrFinalizeMs, gemmaMs } durations,
+    // present once the server side reports them (see wsClient.js); harmless
+    // and null-valued until then.
+    const timer = currentTimer;
+    if (timer) timer.markOnce('polishedReceived');
 
     if (!polishedText) {
       // No speech detected (very short utterance) — per the spec's
@@ -118,8 +171,15 @@ function startDictation() {
 
     replaceCurrentTextViaClipboardPaste(polishedText)
       .then(() => {
+        if (timer) timer.markOnce('pasteDone');
         const now = Date.now();
         const msSinceLast = now - lastPolishedAt;
+
+        // Per-stage latency trace (see lib/timing.js / master-plan §4). Log
+        // it every dictation so a regression is visible from the first run,
+        // and persist the breakdown alongside the session metrics.
+        const t = timer ? timer.summary(timings || {}) : {};
+        if (timer) console.log(timer.logLine(timings || {}));
 
         // Check whether this dictation looks like a correction of the
         // immediately-previous one, and log it to the learning store if so.
@@ -138,8 +198,13 @@ function startDictation() {
         recordSession({
           rawWordCount: rawText.trim().split(/\s+/).filter(Boolean).length,
           polishedWordCount: polishedText.trim().split(/\s+/).filter(Boolean).length,
-          speakingDurationMs: null, // TODO: track actual hotkey-down duration separately from total latency
-          releaseToTextLatencyMs,
+          speakingDurationMs: t.speakingDurationMs ?? null,
+          releaseToTextLatencyMs: t.releaseToTextMs ?? null,
+          timeToFirstPartialMs: t.timeToFirstPartialMs ?? null,
+          releaseToPolishedMs: t.releaseToPolishedMs ?? null,
+          pasteMs: t.pasteMs ?? null,
+          asrFinalizeMs: t.asrFinalizeMs ?? null,
+          gemmaMs: t.gemmaMs ?? null,
           asrPath: 'B', // Path B per CLAUDE.md architecture decision
           appBundleId: lastFrontmostAppBundleId,
           hadFollowupCorrection: Boolean(diff),
@@ -176,6 +241,9 @@ function startDictation() {
 }
 
 function endDictation() {
+  // end-of-speech: stamp it before signalling the server so the
+  // release→polished and release→text deltas measure from the true release.
+  if (currentTimer) currentTimer.markOnce('hotkeyUp');
   if (currentConnection) {
     currentConnection.endUtterance();
   }
@@ -185,6 +253,8 @@ function setupTray() {
   tray = new Tray(path.join(__dirname, '..', 'assets', 'tray-icon.png'));
   const contextMenu = Menu.buildFromTemplate([
     { label: 'Yapflow — hold Right-Cmd to dictate', enabled: false },
+    { type: 'separator' },
+    { label: 'Open metrics dashboard…', click: () => openDashboard() },
     { type: 'separator' },
     { label: 'Quit', click: () => app.quit() },
   ]);
@@ -212,6 +282,9 @@ app.whenReady().then(async () => {
 
 ipcMain.on('audio-chunk', (event, arrayBuffer) => {
   if (currentConnection) {
+    // First chunk reaching the main process ≈ "audio is flowing" — the
+    // anchor for the time-to-first-partial responsiveness metric.
+    if (currentTimer) currentTimer.markOnce('firstChunkSent');
     currentConnection.sendAudioChunk(Buffer.from(arrayBuffer));
   }
 });
@@ -219,6 +292,11 @@ ipcMain.on('audio-chunk', (event, arrayBuffer) => {
 ipcMain.on('renderer-error', (event, message) => {
   console.error('Renderer reported error:', message);
 });
+
+// Dashboard renderer asks for the aggregated metrics (see dashboard/preload.js
+// and lib/metrics.js). Read-only; runs the synchronous better-sqlite3 queries
+// in the main process and returns a plain object.
+ipcMain.handle('metrics:get', () => getMetrics());
 
 app.on('window-all-closed', () => {
   // Don't quit — this is a tray app with no normal windows to begin with.

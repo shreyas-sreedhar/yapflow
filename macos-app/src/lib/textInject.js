@@ -92,8 +92,25 @@ async function typeIncrementalDelta(delta) {
   await runHelper(['type-text', delta]);
 }
 
+/**
+ * Reads the bundle id of the frontmost (focused) app — the app dictated text
+ * will be injected into. Used for per-app metrics and personalization, not
+ * for injection itself. Returns null on any failure (helper missing, no
+ * frontmost app) so callers can treat per-app context as simply "unknown"
+ * rather than erroring — it's a nice-to-have dimension, never load-bearing.
+ */
+async function getFrontmostAppBundleId() {
+  try {
+    const out = await runHelper(['frontmost-app']);
+    return out || null;
+  } catch (err) {
+    return null;
+  }
+}
+
 module.exports = {
   injectViaClipboardPaste,
   replaceCurrentTextViaClipboardPaste,
   typeIncrementalDelta,
+  getFrontmostAppBundleId,
 };
