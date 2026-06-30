@@ -21,11 +21,19 @@
 const { uIOhook, UiohookKey } = require('uiohook-napi');
 const { EventEmitter } = require('events');
 
-// Right-Command, carried forward from Phase 1 per the original spec's Open
-// Decision 3 ("confirm this still feels right or pick another"). Change
-// here if you decide on a different key during testing — this is the only
-// place the hotkey is defined.
-const HOTKEY_CODE = UiohookKey.CtrlRight; // placeholder mapping note below
+// The hold-to-dictate key. Default is Right-Ctrl (UiohookKey.CtrlRight) —
+// chosen because Right-Command's keycode is reported inconsistently across
+// libuiohook/uiohook-napi versions (see note below), so Right-Ctrl is the
+// reliable default. Override without editing code by setting
+// YAPFLOW_HOTKEY_KEYCODE to the numeric keycode you want (discover it with
+// YAPFLOW_DEBUG_KEYS=1, which logs every keydown's keycode).
+const HOTKEY_CODE = process.env.YAPFLOW_HOTKEY_KEYCODE
+  ? parseInt(process.env.YAPFLOW_HOTKEY_KEYCODE, 10)
+  : UiohookKey.CtrlRight;
+
+// When set, log the keycode of every keydown so you can identify the code
+// for the physical key you want to bind, then set YAPFLOW_HOTKEY_KEYCODE.
+const DEBUG_KEYS = Boolean(process.env.YAPFLOW_DEBUG_KEYS);
 
 /**
  * NOTE on Right-Command specifically: uiohook-napi's UiohookKey enum does
@@ -51,7 +59,14 @@ class Hotkey extends EventEmitter {
     if (this._started) return;
     this._started = true;
 
+    console.log(
+      `[hotkey] listening for keycode ${HOTKEY_CODE}` +
+        (process.env.YAPFLOW_HOTKEY_KEYCODE ? ' (from YAPFLOW_HOTKEY_KEYCODE)' : ' (default Right-Ctrl)') +
+        (DEBUG_KEYS ? ' — DEBUG_KEYS on, logging all keydowns' : '')
+    );
+
     uIOhook.on('keydown', (e) => {
+      if (DEBUG_KEYS) console.log(`[hotkey] keydown keycode=${e.keycode}`);
       if (e.keycode === HOTKEY_CODE && !this._isDown) {
         this._isDown = true;
         this.emit('hotkey-down');
