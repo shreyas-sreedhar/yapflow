@@ -46,7 +46,17 @@ OLLAMA_NUM_CTX = int(os.environ.get("YAPFLOW_NUM_CTX", "1024"))
 # Keep the model resident between requests. Do NOT set this to a short
 # duration that causes Ollama to unload/reload the model — see CLAUDE.md
 # Decisions section 9 on CMA fragmentation from repeated load/unload cycles.
-OLLAMA_KEEP_ALIVE = os.environ.get("YAPFLOW_KEEP_ALIVE", "-1")  # -1 = forever
+#
+# Ollama's API treats a STRING keep_alive as a Go duration ("5m", "1h"), and
+# a NUMBER as seconds where a negative value means "forever". So "-1" as a
+# string is invalid ('missing unit in duration "-1"') — it must be the int
+# -1. Coerce plain integers to int here so the common "-1"/seconds cases
+# work, while still allowing duration strings like "5m" to pass through.
+_keep_alive_raw = os.environ.get("YAPFLOW_KEEP_ALIVE", "-1")
+try:
+    OLLAMA_KEEP_ALIVE = int(_keep_alive_raw)  # seconds; -1 = keep resident forever
+except ValueError:
+    OLLAMA_KEEP_ALIVE = _keep_alive_raw  # e.g. "5m", "1h" — a Go duration string
 
 # --- Logging ---
 LOG_LEVEL = os.environ.get("YAPFLOW_LOG_LEVEL", "INFO")
