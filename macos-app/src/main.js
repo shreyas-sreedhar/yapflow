@@ -23,6 +23,7 @@ const {
 } = require('./lib/textInject');
 const { recordIfCorrection, getLearnedTerms, recordSession } = require('./lib/corrections');
 const { DictationTimer } = require('./lib/timing');
+const { getMetrics } = require('./lib/metrics');
 
 // --- Configuration ---
 // In a real build, surface these in a settings window rather than hardcoding.
@@ -36,6 +37,7 @@ const SHARED_SECRET = process.env.YAPFLOW_SECRET || null; // must match jetson-s
 
 let tray = null;
 let captureWindow = null; // hidden window that runs renderer/audioCapture.js
+let dashboardWindow = null; // metrics dashboard, opened on demand from the tray
 let hotkey = null;
 
 let currentConnection = null;
@@ -59,6 +61,32 @@ function createCaptureWindow() {
     },
   });
   captureWindow.loadFile(path.join(__dirname, 'renderer', 'capture.html'));
+}
+
+function openDashboard() {
+  // Occasionally-opened metrics window, kept off the always-running surface
+  // (see CLAUDE.md "keep the always-running surface area minimal"). Reuse the
+  // window if it's already open rather than stacking duplicates.
+  if (dashboardWindow && !dashboardWindow.isDestroyed()) {
+    dashboardWindow.show();
+    dashboardWindow.focus();
+    return;
+  }
+  dashboardWindow = new BrowserWindow({
+    width: 960,
+    height: 800,
+    title: 'Yapflow — Metrics',
+    show: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'dashboard', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  dashboardWindow.loadFile(path.join(__dirname, 'dashboard', 'index.html'));
+  dashboardWindow.on('closed', () => {
+    dashboardWindow = null;
+  });
 }
 
 async function requestPermissions() {
@@ -226,6 +254,8 @@ function setupTray() {
   const contextMenu = Menu.buildFromTemplate([
     { label: 'Yapflow — hold Right-Cmd to dictate', enabled: false },
     { type: 'separator' },
+    { label: 'Open metrics dashboard…', click: () => openDashboard() },
+    { type: 'separator' },
     { label: 'Quit', click: () => app.quit() },
   ]);
   tray.setContextMenu(contextMenu);
@@ -262,6 +292,11 @@ ipcMain.on('audio-chunk', (event, arrayBuffer) => {
 ipcMain.on('renderer-error', (event, message) => {
   console.error('Renderer reported error:', message);
 });
+
+// Dashboard renderer asks for the aggregated metrics (see dashboard/preload.js
+// and lib/metrics.js). Read-only; runs the synchronous better-sqlite3 queries
+// in the main process and returns a plain object.
+ipcMain.handle('metrics:get', () => getMetrics());
 
 app.on('window-all-closed', () => {
   // Don't quit — this is a tray app with no normal windows to begin with.
