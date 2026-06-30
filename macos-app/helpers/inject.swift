@@ -22,6 +22,7 @@
 //   inject paste                          -> synthesizes Cmd+V
 //   inject select-all                     -> synthesizes Cmd+A
 //   inject type-text "<text>"             -> synthesizes the literal text as keystrokes
+//   inject frontmost-app                  -> prints the bundle id of the frontmost app (or empty)
 
 import AppKit
 import Foundation
@@ -93,6 +94,15 @@ func typeText(_ text: String) {
     }
 }
 
+/// Returns the bundle identifier of the app that currently has focus — the
+/// app dictated text will land in. Used purely for per-app metrics and
+/// personalization (see ../src/lib/corrections.js). The hidden Electron
+/// capture window never takes focus and the tray app has no key window, so
+/// the frontmost app stays the user's actual target.
+func frontmostAppBundleId() -> String {
+    return NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+}
+
 // --- entry point ---
 
 let arguments = CommandLine.arguments
@@ -127,6 +137,9 @@ case "type-text":
         exit(1)
     }
     typeText(arguments[2])
+
+case "frontmost-app":
+    print(frontmostAppBundleId())
 
 default:
     FileHandle.standardError.write("Unknown command: \(command)\n".data(using: .utf8)!)

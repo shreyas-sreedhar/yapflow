@@ -16,7 +16,11 @@ const path = require('path');
 
 const { Hotkey } = require('./lib/hotkey');
 const { DictationConnection } = require('./lib/wsClient');
-const { replaceCurrentTextViaClipboardPaste, typeIncrementalDelta } = require('./lib/textInject');
+const {
+  replaceCurrentTextViaClipboardPaste,
+  typeIncrementalDelta,
+  getFrontmostAppBundleId,
+} = require('./lib/textInject');
 const { recordIfCorrection, getLearnedTerms, recordSession } = require('./lib/corrections');
 const { DictationTimer } = require('./lib/timing');
 
@@ -39,7 +43,7 @@ let currentTimer = null; // per-stage latency trace for the in-flight dictation 
 let lastInjectedText = ''; // tracks live partial text WITHIN the current dictation only
 let lastCompletedPolishedText = ''; // the polished result of the most recently FINISHED dictation, used for cross-dictation correction detection
 let lastPolishedAt = 0;
-let lastFrontmostAppBundleId = null; // TODO: populate via a frontmost-app helper if needed for per-app personalization
+let lastFrontmostAppBundleId = null; // bundle id of the app being dictated into; refreshed per dictation (see startDictation)
 
 function createCaptureWindow() {
   // Hidden, never shown — exists purely to host the renderer-side
@@ -75,6 +79,19 @@ function startDictation() {
   // (≈ mic-start) immediately. See lib/timing.js.
   currentTimer = new DictationTimer();
   lastInjectedText = '';
+
+  // Capture which app we're dictating into, for per-app metrics and
+  // personalization. Read asynchronously so we don't add a process-spawn to
+  // the hotkey-down hot path — it resolves long before the session is
+  // recorded (on 'polished'). The knownTerms lookup below may use the prior
+  // value; getLearnedTerms tolerates that (it always includes app-agnostic
+  // terms too), so the only cost is a marginally-less-targeted term list on
+  // the very first dictation into a newly-focused app.
+  getFrontmostAppBundleId()
+    .then((id) => {
+      lastFrontmostAppBundleId = id;
+    })
+    .catch(() => {});
 
   // Personal-dictionary learning loop (see CLAUDE.md Decisions section 5 /
   // docs/yapflow-master-plan.md Section 3.3): pull the locally-learned
