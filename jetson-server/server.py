@@ -21,7 +21,12 @@ persistent connection per dictation):
     {"type": "partial", "text": "...", "is_final": true}
 
   Jetson -> Mac, once Gemma has polished the final transcript:
-    {"type": "polished", "raw_text": "...", "polished_text": "..."}
+    {"type": "polished", "raw_text": "...", "polished_text": "...",
+     "timings": {"asr_finalize_ms": <int>, "gemma_ms": <int>}}
+    (timings are server-measured DURATIONS, not timestamps — the Mac merges
+    them into its own per-stage latency trace by value, never by wall-clock,
+    since the two machines' clocks aren't synced. See the Mac's
+    mac-app/src/lib/timing.js and docs/yapflow-master-plan.md Section 4.)
 
   Jetson -> Mac, on any server-side error during a session:
     {"type": "error", "message": "..."}
@@ -40,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -155,22 +161,38 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
         return
 
     # Hotkey released (or connection ended cleanly): finalize ASR, run the
-    # single Gemma polish call, send the result back.
+    # single Gemma polish call, send the result back. We time each stage
+    # (monotonic perf_counter) so the Mac can attribute post-release latency
+    # to ASR vs. Gemma — see master-plan §4 / mac-app/src/lib/timing.js.
     forward_task.cancel()
+    _t_finalize_start = time.perf_counter()
     raw_text = session.finalize()
     session.close()
+    asr_finalize_ms = round((time.perf_counter() - _t_finalize_start) * 1000)
 
     if not raw_text.strip():
         # Very short utterance, or no speech detected. Per the spec's
         # resilience checklist (Step 6), this should not error or hang —
         # just report back an empty polish result and let the client decide
         # what to do (almost certainly: nothing, no text was said).
-        await websocket.send(json.dumps({"type": "polished", "raw_text": "", "polished_text": ""}))
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "polished",
+                    "raw_text": "",
+                    "polished_text": "",
+                    "timings": {"asr_finalize_ms": asr_finalize_ms, "gemma_ms": None},
+                }
+            )
+        )
         logger.info("Dictation session ended with no speech detected")
         return
 
+    gemma_ms = None
     try:
+        _t_polish_start = time.perf_counter()
         polished_text = polish(raw_text, personalize=True, known_terms=known_terms)
+        gemma_ms = round((time.perf_counter() - _t_polish_start) * 1000)
     except Exception:
         logger.exception("Unhandled error during polish step")
         await websocket.send(
@@ -179,9 +201,18 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
         polished_text = raw_text
 
     await websocket.send(
-        json.dumps({"type": "polished", "raw_text": raw_text, "polished_text": polished_text})
+        json.dumps(
+            {
+                "type": "polished",
+                "raw_text": raw_text,
+                "polished_text": polished_text,
+                "timings": {"asr_finalize_ms": asr_finalize_ms, "gemma_ms": gemma_ms},
+            }
+        )
     )
-    logger.info("Dictation session complete")
+    logger.info(
+        "Dictation session complete (asr_finalize=%sms, gemma=%sms)", asr_finalize_ms, gemma_ms
+    )
 
 
 async def main() -> None:

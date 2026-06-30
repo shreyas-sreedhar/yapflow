@@ -99,9 +99,18 @@ class DictationConnection extends EventEmitter {
         case 'partial':
           this.emit('partial', { text: parsed.text, isFinal: parsed.is_final });
           break;
-        case 'polished':
-          this.emit('polished', { rawText: parsed.raw_text, polishedText: parsed.polished_text });
+        case 'polished': {
+          // Server-measured stage durations (see jetson-server/server.py).
+          // Mapped to the camelCase shape lib/timing.js merges into the trace;
+          // absent on older servers, in which case these stay undefined/null.
+          const t = parsed.timings || {};
+          this.emit('polished', {
+            rawText: parsed.raw_text,
+            polishedText: parsed.polished_text,
+            timings: { asrFinalizeMs: t.asr_finalize_ms ?? null, gemmaMs: t.gemma_ms ?? null },
+          });
           break;
+        }
         case 'error':
           this.emit('server-error', parsed.message);
           break;
