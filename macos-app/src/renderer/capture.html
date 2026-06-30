@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Flow-Local (hidden capture window — not user-visible)</title>
+</head>
+<body>
+  <!--
+    This window is never shown (see main.js createCaptureWindow). It exists
+    only to host the renderer-side getUserMedia/AudioWorklet microphone
+    capture pipeline, since that's the standard, well-maintained way to get
+    raw mic audio in Electron — see audioCapture.js's header comment for why
+    this lives in a renderer rather than a native main-process binding.
+  -->
+  <script src="audioCapture.js"></script>
+</body>
+</html>

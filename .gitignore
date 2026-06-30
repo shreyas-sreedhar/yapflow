@@ -4,3 +4,5 @@ __pycache__/
 .DS_Store
 macos-app/.xcodeproj/xcuserdata/
 macos-app/Build/
+docs/
+CLAUDE.MD
