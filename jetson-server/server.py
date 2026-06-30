@@ -51,8 +51,8 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 import config
-from asr import StreamingSession
-from polish import polish
+from asr import StreamingSession, get_transcriber
+from polish import ensure_model_ready, polish
 
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("yapflow.server")
@@ -215,8 +215,34 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
     )
 
 
+def _warm_models() -> None:
+    """
+    Load Moonshine and preload Gemma at startup so the FIRST dictation isn't
+    slow (the cold-start rough edge documented in README.md). Best-effort: if
+    Ollama isn't up yet or Moonshine's download hasn't finished, log and carry
+    on — the existing lazy paths (get_transcriber / ensure_model_ready) will
+    retry on first use. Crucially this does NOT load/unload in a cycle, so it
+    doesn't risk the CMA fragmentation called out in CLAUDE.md Decision 9 —
+    each model loads exactly once and stays resident.
+    """
+    try:
+        logger.info("Warming Moonshine model at startup...")
+        get_transcriber()
+    except Exception:
+        logger.exception("Moonshine warm-up failed; will load lazily on first dictation")
+    try:
+        logger.info("Warming Gemma (Ollama) at startup...")
+        ensure_model_ready()
+    except Exception:
+        logger.exception("Gemma warm-up failed; will load lazily on first dictation")
+
+
 async def main() -> None:
     logger.info("Starting Yapflow server on %s:%d", config.HOST, config.PORT)
+    # Warm-up is blocking model I/O; run it off the event loop so startup
+    # logging/serve setup isn't stalled, but await it before accepting
+    # connections so the first client doesn't race a half-loaded model.
+    await asyncio.get_event_loop().run_in_executor(None, _warm_models)
     async with websockets.serve(_handle_session, config.HOST, config.PORT, max_size=2**22):
         await asyncio.Future()  # run forever
 
