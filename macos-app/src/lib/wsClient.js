@@ -13,8 +13,11 @@
  */
 
 const WebSocket = require('ws');
-const { OpusEncoder } = require('@discordjs/opus');
 const { EventEmitter } = require('events');
+// NOTE: @discordjs/opus is a NATIVE module and is required lazily (in the
+// constructor) only when SEND_OPUS_OVER_WIRE is true — see that flag below.
+// The default raw-PCM path must not depend on the native binary being built
+// for the current Electron ABI, so we deliberately do NOT require it here.
 
 const SAMPLE_RATE = 16000;
 const CHANNELS = 1;
@@ -61,7 +64,16 @@ class DictationConnection extends EventEmitter {
     this._sharedSecret = sharedSecret;
     this._knownTerms = knownTerms;
     this._ws = null;
-    this._opusEncoder = SEND_OPUS_OVER_WIRE ? new OpusEncoder(SAMPLE_RATE, CHANNELS) : null;
+    if (SEND_OPUS_OVER_WIRE) {
+      // Loaded only on this path: the native @discordjs/opus binary must be
+      // rebuilt for the current Electron ABI first (`npm run rebuild`). The
+      // default raw-PCM path (flag = false) avoids this native dependency
+      // entirely — see the flag's doc comment above.
+      const { OpusEncoder } = require('@discordjs/opus');
+      this._opusEncoder = new OpusEncoder(SAMPLE_RATE, CHANNELS);
+    } else {
+      this._opusEncoder = null;
+    }
     this._isOpen = false;
     this._pendingChunks = [];
   }
