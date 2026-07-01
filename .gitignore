@@ -7,3 +7,6 @@ macos-app/Build/
 docs/
 CLAUDE.MD
 readme.*
+
+*/node_modules/
+macos-app/helpers/*

@@ -160,6 +160,13 @@ function startDictation() {
     const timer = currentTimer;
     if (timer) timer.markOnce('polishedReceived');
 
+    // Show what came back, both what Moonshine heard (raw) and what Gemma
+    // produced (polished), so you can eyeball transcription/polish quality
+    // right next to the latency trace. Logged before the paste so it appears
+    // even if injection fails.
+    console.log(`[text] raw:      ${JSON.stringify(rawText)}`);
+    console.log(`[text] polished: ${JSON.stringify(polishedText)}`);
+
     if (!polishedText) {
       // No speech detected (very short utterance) — per the spec's
       // resilience checklist, don't error or hang, just leave whatever
