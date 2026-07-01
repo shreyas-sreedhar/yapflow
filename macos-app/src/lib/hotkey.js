@@ -18,35 +18,25 @@
  * in main.js for how that's surfaced to the user.
  */
 
-const { uIOhook, UiohookKey } = require('uiohook-napi');
+const { uIOhook } = require('uiohook-napi');
 const { EventEmitter } = require('events');
 
-// The hold-to-dictate key. Default is Right-Ctrl (UiohookKey.CtrlRight) —
-// chosen because Right-Command's keycode is reported inconsistently across
-// libuiohook/uiohook-napi versions (see note below), so Right-Ctrl is the
-// reliable default. Override without editing code by setting
-// YAPFLOW_HOTKEY_KEYCODE to the numeric keycode you want (discover it with
-// YAPFLOW_DEBUG_KEYS=1, which logs every keydown's keycode).
+// The hold-to-dictate key: Right-Command, keycode 3676. Verified on-device
+// via YAPFLOW_DEBUG_KEYS (libuiohook reports VC_META_R = 0x0E5C = 3676).
+// Hard-coded as a number rather than a UiohookKey.* name because the enum
+// doesn't expose a reliable distinct Right-Command entry across versions.
+// Note: the Fn (globe) key can't be used here — libuiohook reports it as
+// keycode 0 (undefined), so it isn't bindable at this layer.
+// Override without editing code by setting YAPFLOW_HOTKEY_KEYCODE to the
+// numeric keycode you want (discover it with YAPFLOW_DEBUG_KEYS=1, which
+// logs every keydown's keycode).
 const HOTKEY_CODE = process.env.YAPFLOW_HOTKEY_KEYCODE
   ? parseInt(process.env.YAPFLOW_HOTKEY_KEYCODE, 10)
-  : UiohookKey.CtrlRight;
+  : 3676; // Right-Command
 
 // When set, log the keycode of every keydown so you can identify the code
 // for the physical key you want to bind, then set YAPFLOW_HOTKEY_KEYCODE.
 const DEBUG_KEYS = Boolean(process.env.YAPFLOW_DEBUG_KEYS);
-
-/**
- * NOTE on Right-Command specifically: uiohook-napi's UiohookKey enum does
- * not expose a distinct Right-Command keycode on all versions — Meta/Cmd
- * keys can be inconsistently reported as left vs right across platforms in
- * libuiohook. If UiohookKey.MetaRight (or similar) is available in the
- * installed version, prefer it over CtrlRight above. Verify by logging
- * `e.keycode` for actual Right-Cmd presses on your machine during Step 0
- * of the build (see docs/yapflow-master-plan.md execution checklist) and
- * hard-code the confirmed numeric keycode here if the named export doesn't
- * match what you expect. This is exactly the kind of thing that's faster
- * to verify empirically on real hardware than to guess from documentation.
- */
 
 class Hotkey extends EventEmitter {
   constructor() {
@@ -61,7 +51,7 @@ class Hotkey extends EventEmitter {
 
     console.log(
       `[hotkey] listening for keycode ${HOTKEY_CODE}` +
-        (process.env.YAPFLOW_HOTKEY_KEYCODE ? ' (from YAPFLOW_HOTKEY_KEYCODE)' : ' (default Right-Ctrl)') +
+        (process.env.YAPFLOW_HOTKEY_KEYCODE ? ' (from YAPFLOW_HOTKEY_KEYCODE)' : ' (default Right-Cmd)') +
         (DEBUG_KEYS ? ' — DEBUG_KEYS on, logging all keydowns' : '')
     );
 
