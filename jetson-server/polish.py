@@ -53,18 +53,33 @@ MAX_TERM_LENGTH = 64
 #   "kind of"  -> "what kind of car"
 #   "sort of"  -> "sort of thing"
 #   "ah"       -> "ah ha", and it's a real interjection
-# "you know" is safe as a two-word phrase in a way its component words are not.
+#   "you know" -> "do you know him", "did you know", "you know how to"
 _FILLER_PATTERN = re.compile(
-    r"\b(?:umm?|uhh?|erm|hmm+|mhm|you\s+know)\b[\s,]*",
+    r"\b(?:umm?|uhh?|erm|hmm+|mhm)\b[\s,]*",
     re.IGNORECASE,
 )
 
-# "like" only when it's fenced by commas on both sides — "it was, like, huge".
-# That framing is the one context where it's reliably a filler rather than a
-# preposition or verb. Both commas go with it: the sentence read without the
-# aside doesn't want a comma there ("it was really big", not "it was, really
-# big").
-_FENCED_LIKE = re.compile(r",\s*like\s*,\s*", re.IGNORECASE)
+# Two phrases that ARE fillers, but only in their comma-fenced form. Requiring an
+# adjacent comma is what separates the filler use from the load-bearing one:
+#
+#   "it was, like, huge"        filler      vs  "write it like this"
+#   "you know, the thing is"    filler      vs  "do you know him"
+#
+# Getting this wrong deletes words the user said. An earlier version matched
+# "you know" as a bare phrase and turned "do you know him" into "do him".
+#
+# Fenced forms handled: leading ("you know, ..."), medial (", you know, ..."),
+# and trailing ("..., you know."). Both commas go with a medial match, since the
+# sentence read without the aside doesn't want one there.
+_FENCED_FILLERS = [
+    # Medial: collapse to one space, taking both commas.
+    (re.compile(r",\s*like\s*,\s*", re.IGNORECASE), " "),
+    (re.compile(r",\s*you\s+know\s*,\s*", re.IGNORECASE), " "),
+    # Leading: nothing to join, so drop it entirely.
+    (re.compile(r"^\s*you\s+know\s*,\s*", re.IGNORECASE), ""),
+    # Trailing, before terminal punctuation or end of string.
+    (re.compile(r",\s*you\s+know\s*(?=[.!?]|$)", re.IGNORECASE), ""),
+]
 
 # Standalone lowercase "i" -> "I". Moonshine usually gets this right, but
 # filler removal and line-joining can leave one mid-sentence where it started a
@@ -113,7 +128,11 @@ def _strip_fillers(text: str) -> str:
     whitespace and any comma that followed the filler, so "well, um, I think"
     collapses cleanly to "well, I think" rather than leaving ", ," behind.
     """
-    text = _FENCED_LIKE.sub(" ", text)
+    # Fenced phrases first: they consume the commas that would otherwise be left
+    # dangling once the phrase between them is gone. Medial matches leave a space
+    # to join the two halves; leading and trailing matches leave nothing.
+    for pattern, replacement in _FENCED_FILLERS:
+        text = pattern.sub(replacement, text)
     return _FILLER_PATTERN.sub("", text)
 
 
