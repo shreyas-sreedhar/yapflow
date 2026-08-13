@@ -3,7 +3,7 @@
  * (see preload.js) and draws everything with hand-rolled inline SVG — no
  * external chart library, no network — per the project's zero-cloud ethos.
  *
- * What it surfaces (docs/yapflow-master-plan.md Section 4): WPM trend (is
+ * What it surfaces: WPM trend (is
  * dictation making you faster?), correction-rate trend (is the personal
  * dictionary working? — falling is the signature of success), release→text
  * latency percentiles, the per-stage latency breakdown (where the time

@@ -1,19 +1,18 @@
 /**
- * Local SQLite storage for two things, per docs/yapflow-master-plan.md
- * Sections 3 and 4:
+ * Local SQLite storage for two things:
  *
  *   1. `corrections` — the personal-dictionary learning loop. NOT
- *      fine-tuning (see CLAUDE.md Decisions section 5) — just a growing
- *      word-list consulted at inference time, fed back into the Gemma
- *      polish prompt on every future dictation.
+ *      fine-tuning — just a growing word-list consulted at inference time,
+ *      sent to the Jetson with each dictation, where the touch-up step uses it
+ *      for whole-word substitution.
  *
  *   2. `sessions` — per-dictation metrics (timing, word counts, ASR path,
  *      app context, correction-follow-up), purely for the user's own
  *      visibility. No leaderboard framing, no comparison to anyone else.
  *
- * Lives on the Mac, not the Jetson — see CLAUDE.md Decisions / Architecture
- * section for why (zero network round-trip needed to consult before every
- * dictation, and it's meaningless without the Mac client running anyway).
+ * Lives on the Mac, not the Jetson: no network round-trip is needed to consult
+ * it before a dictation, and it's meaningless without the Mac client running
+ * anyway.
  */
 
 const Database = require('better-sqlite3');
@@ -68,8 +67,8 @@ function getDb() {
 }
 
 /**
- * Additive schema migration for the per-stage latency columns (master-plan
- * §4 instrumentation). A DB created before these columns existed won't have
+ * Additive schema migration for the per-stage latency columns. A DB created
+ * before these columns existed won't have
  * them, and `CREATE TABLE IF NOT EXISTS` won't add them to an existing table
  * — so add each missing column idempotently. SQLite has no `ADD COLUMN IF
  * NOT EXISTS`, hence the table_info check.
@@ -95,7 +94,7 @@ function migrateSessionsColumns(database) {
 /**
  * Very small word-level diff: returns the single (or first) span of words
  * that differ between two short strings. Good enough for catching "one or
- * two words changed" corrections per the spec's heuristic — not meant to be
+ * two words changed" corrections — not meant to be
  * a general-purpose diff algorithm. If you need something more robust later,
  * consider the `diff` npm package, but this keeps the dependency footprint
  * minimal for what's actually a narrow job.
@@ -121,10 +120,9 @@ function simpleWordDiff(a, b) {
 
 /**
  * Heuristic for "is this re-dictation actually a correction of the last
- * one, or an unrelated new dictation?" — see
- * docs/yapflow-master-plan.md Section 3.2 for the full reasoning
- * (timing + word-overlap as proxies for the "alternates list" signal that
- * UI-based correction systems use, which this app doesn't have).
+ * one, or an unrelated new dictation?" Timing plus word-overlap stand in for
+ * the "alternates list" signal that UI-based correction systems use and this
+ * app doesn't have.
  */
 function looksLikeCorrection(previous, current, msSinceLast) {
   const CORRECTION_WINDOW_MS = 15000;
@@ -173,10 +171,9 @@ function recordIfCorrection({ previousPolishedText, currentRawText, currentPolis
 }
 
 /**
- * Returns the most relevant learned terms to feed into the Gemma polish
- * prompt for this dictation, filtered by app where available. This is the
- * "personal dictionary" — see CLAUDE.md Decisions section 5: a word-list
- * consulted at inference time, not a fine-tuned model.
+ * Returns the most relevant learned terms for this dictation, filtered by app
+ * where available, to send to the Jetson's touch-up step. This is the "personal
+ * dictionary": a word-list consulted at inference time, not a fine-tuned model.
  */
 function getLearnedTerms({ appBundleId, limit = 20 }) {
   const database = getDb();

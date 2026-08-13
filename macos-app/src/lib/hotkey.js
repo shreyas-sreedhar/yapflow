@@ -1,7 +1,7 @@
 /**
  * Global hotkey detection for hold-to-dictate.
  *
- * IMPORTANT — see ../../../CLAUDE.md Decisions section 3: this deliberately
+ * IMPORTANT: this deliberately
  * does NOT use Electron's built-in `globalShortcut` module, because
  * globalShortcut only fires a single combined event on key-down — it has no
  * concept of "held" vs "released", which is the entire UX this app needs

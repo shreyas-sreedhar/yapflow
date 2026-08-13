@@ -37,10 +37,10 @@ let mediaStream = null;
 let workletNode = null;
 let sourceNode = null;
 let isCapturing = false;
-// One-shot guard so the "first chunk" stage log fires once per capture, not
-// every audio frame (see Log-driven-development in CLAUDE.md). The
-// authoritative per-stage trace lives in the main process (lib/timing.js);
-// these renderer logs just make the capture stage self-documenting.
+// One-shot guard so the "first chunk" stage log fires once per capture rather
+// than on every audio frame. The authoritative per-stage trace lives in the main
+// process (lib/timing.js); these renderer logs just make the capture stage
+// self-documenting.
 let loggedFirstChunk = false;
 
 // --- Streaming resampler state ---

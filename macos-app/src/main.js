@@ -37,8 +37,8 @@ const { getMetrics } = require('./lib/metrics');
 // --- Configuration ---
 // In a real build, surface these in a settings window rather than hardcoding.
 // Keeping them as simple constants here since the settings UI is explicitly
-// out of scope for this first pass (see CLAUDE.md: "keep the always-running
-// surface area minimal").
+// out of scope for this first pass, to keep the always-running surface area
+// minimal.
 const JETSON_HOST = process.env.YAPFLOW_JETSON_HOST || 'jetson.local';
 const JETSON_PORT = process.env.YAPFLOW_JETSON_PORT || '8765';
 const JETSON_URL = `ws://${JETSON_HOST}:${JETSON_PORT}`;
@@ -59,8 +59,8 @@ let lastFrontmostAppBundleId = null; // bundle id of the app being dictated into
 function createCaptureWindow() {
   // Hidden, never shown — exists purely to host the renderer-side
   // getUserMedia/AudioWorklet capture pipeline (see renderer/audioCapture.js
-  // and the comment in package.json/CLAUDE.md about why mic capture lives
-  // in the renderer rather than a native main-process binding).
+  // for why mic capture lives in the renderer rather than a native
+  // main-process binding).
   captureWindow = new BrowserWindow({
     show: false,
     webPreferences: {
@@ -74,7 +74,7 @@ function createCaptureWindow() {
 
 function openDashboard() {
   // Occasionally-opened metrics window, kept off the always-running surface
-  // (see CLAUDE.md "keep the always-running surface area minimal"). Reuse the
+  // to keep the always-running surface area minimal. Reuse the
   // window if it's already open rather than stacking duplicates.
   if (dashboardWindow && !dashboardWindow.isDestroyed()) {
     dashboardWindow.show();
@@ -271,7 +271,7 @@ function setupConnection() {
         const now = Date.now();
         const msSinceLast = now - lastPolishedAt;
 
-        // Per-stage latency trace (see lib/timing.js / master-plan §4). Log
+        // Per-stage latency trace (see lib/timing.js). Log
         // it every dictation so a regression is visible from the first run,
         // and persist the breakdown alongside the session metrics.
         const t = timer ? timer.summary(timings || {}) : {};

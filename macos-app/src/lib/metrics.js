@@ -1,6 +1,6 @@
 /**
  * Read-only aggregate queries over the local `sessions` / `corrections`
- * tables, for the metrics dashboard (docs/yapflow-master-plan.md Section 4).
+ * tables, for the metrics dashboard.
  *
  * This is the user's OWN visibility into whether dictation is making them
  * faster and whether the personal dictionary is working — explicitly not a

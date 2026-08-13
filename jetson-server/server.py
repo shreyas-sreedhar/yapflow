@@ -316,10 +316,9 @@ async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) 
         pass
 
     if not raw_text.strip():
-        # Very short utterance, or no speech detected. Per the spec's
-        # resilience checklist (Step 6), this should not error or hang —
-        # just report back an empty polish result and let the client decide
-        # what to do (almost certainly: nothing, no text was said).
+        # Very short utterance, or no speech detected. Must not error or hang —
+        # report an empty result and let the client decide what to do (almost
+        # certainly: retract any live partial text and otherwise do nothing).
         await websocket.send(
             json.dumps(
                 {

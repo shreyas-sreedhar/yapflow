@@ -1,8 +1,7 @@
 /**
  * Per-dictation latency instrumentation.
  *
- * Per ../../../CLAUDE.md ("Working discipline → Log-driven development") and
- * docs/yapflow-master-plan.md Section 4: capture per-stage timestamps, not
+ * Capture per-stage timestamps, not
  * just one end-to-end number, so a latency regression is attributable to a
  * specific stage (the bottleneck is far more often ASR finalization or
  * buffering than Gemma — only a per-stage trace makes that visible).

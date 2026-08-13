@@ -11,8 +11,7 @@ import os
 HOST = os.environ.get("YAPFLOW_HOST", "0.0.0.0")
 PORT = int(os.environ.get("YAPFLOW_PORT", "8765"))
 
-# Optional shared-secret header, carried forward from Phase 1 per the spec's
-# Open Decision 4 ("trivial to add, no real downside"). Set this to a random
+# Optional shared secret: trivial to add, no real downside. Set this to a random
 # string and put the same value in the Mac app's config. Leave as None to
 # disable the check entirely (fine on a trusted home LAN, but the check is
 # nearly free, so there's little reason not to set it).
