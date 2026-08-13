@@ -129,7 +129,15 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
         try:
             async for result in session.results():
                 await websocket.send(
-                    json.dumps({"type": "partial", "text": result.text, "is_final": result.is_final})
+                    json.dumps(
+                        {
+                            "type": "partial",
+                            "text": result.text,
+                            "is_final": result.is_final,
+                            "line_index": result.line_index,
+                            "session_text": result.session_text,
+                        }
+                    )
                 )
         except websockets.exceptions.ConnectionClosed:
             pass
@@ -167,13 +175,22 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
 
     except websockets.exceptions.ConnectionClosed:
         logger.info("Connection closed by client mid-dictation (network drop?)")
-        # Per the spec's resilience checklist (Step 6): if the Jetson
-        # connection drops mid-dictation, we simply stop here. The Mac
-        # client is responsible for leaving whatever raw partial text it
-        # already injected in place, rather than losing it — see
-        # mac-app/src/lib/wsClient.js.
+        # If the connection drops mid-dictation there's nobody left to send the
+        # transcript to, so we just tear down. The Mac client is responsible for
+        # leaving whatever raw partial text it already injected in place rather
+        # than losing it — see macos-app/src/lib/wsClient.js.
+        #
+        # finalize() must still run even though we discard its result: it's what
+        # calls _stream.stop(), and without it the Moonshine stream and its
+        # thread leak for the lifetime of the process. This path used to call
+        # close() alone, which only removes the listener.
         forward_task.cancel()
-        session.close()
+        try:
+            session.finalize()
+        except Exception:
+            logger.exception("Error finalizing ASR session after connection drop")
+        finally:
+            session.close()
         return
 
     # Hotkey released (or connection ended cleanly): finalize ASR, run the

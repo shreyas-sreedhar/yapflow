@@ -1,11 +1,7 @@
 """
 Streaming ASR wrapper around Moonshine v2 (moonshine_voice package).
 
-This is deliberately modeled closely on Moonshine's own official reference
-example (examples/python/ollama-voice/ollama_voice.py in moonshine-ai/moonshine),
-which already demonstrates exactly this pairing: live microphone transcription
-feeding a Gemma model through Ollama. The real API surface, confirmed from
-that source and the library's README, is:
+The API surface used here, per the library's README:
 
     Transcriber(model_path=..., model_arch=...)   # or get_model_for_language()
     transcriber.add_listener(listener)
@@ -14,13 +10,10 @@ that source and the library's README, is:
     transcriber.stop()
     transcriber.create_stream(update_interval=...)   # for multiple concurrent inputs
 
-This project differs from that example in one important way: the official
-example uses MicTranscriber to read directly from the Jetson's own microphone.
-We don't want that — the microphone is on the MacBook, and audio arrives here
-over a WebSocket, already Opus-decoded into PCM by the time it reaches this
-module. So we use the lower-level Transcriber + Stream classes instead of
-MicTranscriber, and push audio in ourselves via add_audio() as Opus packets
-arrive and get decoded, rather than letting the library pull from a local mic.
+Note we do NOT use the library's MicTranscriber, which reads from the local
+machine's microphone. The microphone is on the MacBook; audio arrives here as
+raw PCM16 over a WebSocket. So we use the lower-level Transcriber + Stream
+classes and push audio in ourselves via add_audio().
 
 Why Moonshine v2 over Whisper at all: Whisper always operates on a fixed
 30-second input window regardless of utterance length, and caches nothing
@@ -28,15 +21,20 @@ between calls, so live captioning means re-processing audio from scratch on
 every update. Moonshine's streaming models process exactly the audio they're
 given and cache encoder/decoder state, so most of the latency cost is paid
 incrementally while the user is still talking, not after they release the
-hotkey. See docs/yapflow-master-plan.md Section 2.2 for the full reasoning
-and benchmark numbers — don't swap this out for faster-whisper without
-re-reading that.
+hotkey. That property is the whole reason this design works over a LAN hop —
+don't swap it for faster-whisper or whisper.cpp without measuring
+release-to-text latency before and after.
+
+Transcript accumulation lives in _QueueListener, not in the async generator
+that feeds the websocket. See that class for why — it's the fix for a bug that
+silently dropped everything said before a mid-dictation pause.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -54,6 +52,14 @@ _transcriber: Optional[Transcriber] = None
 # but we standardize here so the rest of the pipeline only has one rate to
 # reason about.
 PCM_SAMPLE_RATE = 16000
+
+# How long finalize() waits for stop()'s final on_line_completed callback before
+# giving up and returning whatever it has accumulated. This is a safety net, not
+# an expected cost: for a streaming model the final decode is already mostly
+# done, so the callback normally lands in single-digit milliseconds. The ceiling
+# exists so a missed callback truncates a transcript instead of hanging the
+# dictation.
+FINALIZE_TIMEOUT_SECONDS = 0.25
 
 
 def get_transcriber() -> Transcriber:
@@ -94,8 +100,21 @@ def get_transcriber() -> Transcriber:
 
 @dataclass
 class PartialResult:
+    # The text of the single line this event is about. Moonshine's events are
+    # per-line, and a line ends at a natural speech pause — so this does NOT
+    # grow monotonically across a dictation. When the speaker pauses, the
+    # current line completes and the next event starts a fresh line back at the
+    # beginning.
     text: str
     is_final: bool
+    # Ordinal of the line this event refers to within the session, so a client
+    # can distinguish "the current line grew" from "a new line started".
+    line_index: int
+    # The whole session transcript so far, all lines joined. THIS is what a
+    # client injecting text at a cursor wants: it does grow monotonically (up to
+    # Moonshine revising the tail of the active line), so diffing against it is
+    # safe where diffing against `text` is not.
+    session_text: str
 
 
 class _QueueListener(TranscriptEventListener):
@@ -103,27 +122,107 @@ class _QueueListener(TranscriptEventListener):
     Bridges Moonshine's synchronous callback-based event model into an
     asyncio queue, so the websocket handler can `await` results instead of
     juggling callbacks directly alongside socket I/O.
+
+    This listener is ALSO the authoritative accumulator of the transcript.
+    That's deliberate and it's the fix for a real bug: the accumulation used to
+    live in StreamingSession.results(), the async generator driven by the
+    websocket handler's forwarding task. The handler cancels that task before
+    calling finalize(), so the final on_line_completed fired by stop() was
+    queued and then never consumed — finalize() returned the last *partial*
+    instead of the finalized text. Accumulating here, in the callbacks
+    themselves, makes the transcript independent of whether anyone is draining
+    the queue.
+
+    Moonshine invokes these callbacks from its own thread, so the accumulator
+    state is guarded by a lock and the queue is fed via call_soon_threadsafe.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue[PartialResult]"):
         self._loop = loop
         self._queue = queue
+        self._lock = threading.Lock()
+        # Lines Moonshine has marked complete, in order. Per the library's
+        # guarantees, a completed line is never modified again.
+        self._completed_lines: list[str] = []
+        # The line currently being spoken, which will keep changing.
+        self._active_line = ""
+        # Set whenever a line completes, so finalize() can wait for the
+        # completion that stop() triggers rather than racing it.
+        self._line_completed = threading.Event()
+
+    def _publish(self, result: PartialResult) -> None:
+        """
+        Hand a result to the asyncio side. Tolerates a closed/finished loop:
+        by the time a late callback arrives the handler may already be gone,
+        and that must not raise inside Moonshine's thread.
+        """
+        try:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, result)
+        except RuntimeError:
+            pass
 
     def on_line_text_changed(self, event):
-        # Incremental update while the user is still speaking — push at the
-        # cursor live, per the spec's Path B design.
-        self._loop.call_soon_threadsafe(
-            self._queue.put_nowait, PartialResult(text=event.line.text, is_final=False)
+        # Incremental update while the user is still speaking.
+        with self._lock:
+            self._active_line = event.line.text
+            line_index = len(self._completed_lines)
+        self._publish(
+            PartialResult(
+                text=event.line.text,
+                is_final=False,
+                line_index=line_index,
+                session_text=self.transcript(),
+            )
         )
 
     def on_line_completed(self, event):
-        # Moonshine decided the user paused. This can fire mid-dictation if
-        # the user pauses naturally — that's fine, it just means a finalized
-        # line is available; StreamingSession.finalize() is what actually
-        # ends the *session* when the hotkey is released.
-        self._loop.call_soon_threadsafe(
-            self._queue.put_nowait, PartialResult(text=event.line.text, is_final=True)
+        # Moonshine decided the user paused. This fires mid-dictation on a
+        # natural pause, which is exactly the case the old scalar
+        # `_last_line_text` mishandled: it overwrote rather than accumulated, so
+        # pausing mid-sentence discarded everything said before the pause.
+        with self._lock:
+            self._completed_lines.append(event.line.text)
+            self._active_line = ""
+            line_index = len(self._completed_lines) - 1
+        self._line_completed.set()
+        self._publish(
+            PartialResult(
+                text=event.line.text,
+                is_final=True,
+                line_index=line_index,
+                session_text=self.transcript(),
+            )
         )
+
+    def transcript(self) -> str:
+        """
+        The full session transcript: every completed line plus whatever is
+        still in flight, joined with single spaces. Empty lines are dropped so a
+        spurious empty completion can't inject double spaces.
+        """
+        with self._lock:
+            parts = [*self._completed_lines, self._active_line]
+        return " ".join(part.strip() for part in parts if part and part.strip())
+
+    def transcript_has_active_line(self) -> bool:
+        """
+        Whether a line is currently in flight. finalize() uses this to decide
+        whether stop() has anything left to complete — if the user's last words
+        already landed as a completed line, there's no callback coming and no
+        reason to spend the timeout waiting for one.
+        """
+        with self._lock:
+            return bool(self._active_line.strip())
+
+    def wait_for_completion(self, timeout: float) -> bool:
+        """
+        Block until a line-completed callback lands, up to `timeout` seconds.
+        Used by finalize() to give stop()'s final callback a chance to arrive.
+        """
+        return self._line_completed.wait(timeout)
+
+    def arm_completion_wait(self) -> None:
+        self._line_completed.clear()
 
 
 class StreamingSession:
@@ -145,7 +244,7 @@ class StreamingSession:
         )
         self._stream.add_listener(self._listener)
         self._stream.start()
-        self._last_line_text = ""
+        self._finalized = False
 
     def feed_pcm_int16(self, pcm_int16_bytes: bytes) -> None:
         """
@@ -168,19 +267,46 @@ class StreamingSession:
         """
         while True:
             result = await self._queue.get()
-            self._last_line_text = result.text
             yield result
 
     def finalize(self) -> str:
         """
-        Call when the hotkey is released. Stops the stream, which per the
-        library's documented behavior marks any still-active line complete
-        and fires a final on_line_completed — so the most recent queued
-        result (or _last_line_text as a fallback if the queue races) is the
-        raw transcript to send to the Gemma polish step.
+        Call when the hotkey is released. Returns the complete raw transcript
+        for the whole session — every line, not just the last one.
+
+        stop() marks any still-active line complete and fires a final
+        on_line_completed from Moonshine's thread. That callback is what moves
+        the in-flight line into the completed list, so we wait briefly for it to
+        land rather than reading the accumulator immediately and racing it.
+
+        The wait is bounded: if the callback never arrives we return what we
+        already have. Degrading to a slightly-truncated transcript is acceptable;
+        hanging the dictation is not.
+
+        Idempotent — safe to call from both the normal release path and the
+        connection-dropped cleanup path.
         """
-        self._stream.stop()
-        return self._last_line_text
+        if self._finalized:
+            return self._listener.transcript()
+        self._finalized = True
+
+        had_active_line = bool(self._listener.transcript_has_active_line())
+        if had_active_line:
+            self._listener.arm_completion_wait()
+
+        try:
+            self._stream.stop()
+        except Exception:
+            logger.exception("Error stopping ASR stream during finalize")
+
+        if had_active_line and not self._listener.wait_for_completion(FINALIZE_TIMEOUT_SECONDS):
+            logger.warning(
+                "No line-completed callback within %.2fs of stop(); "
+                "returning accumulated transcript as-is",
+                FINALIZE_TIMEOUT_SECONDS,
+            )
+
+        return self._listener.transcript()
 
     def close(self) -> None:
         try:
