@@ -57,6 +57,18 @@ let lastCompletedPolishedText = ''; // the polished result of the most recently 
 let lastPolishedAt = 0;
 let lastFrontmostAppBundleId = null; // bundle id of the app being dictated into; refreshed per dictation (see startDictation)
 
+// Monotonic dictation counter. Async work — a queued injection, the
+// end-of-utterance handshake — is tagged with the generation it belongs to and
+// skipped if the user has since started a new dictation. Declared up here with
+// the rest of the module state because queueInjection() below closes over it.
+let dictationGeneration = 0;
+// Which generation is currently waiting to end, or null if none. The handshake
+// with the renderer is asynchronous, so without this a release-then-re-press
+// inside the fallback window let the previous dictation's pending end send
+// end_of_utterance for the NEW one, cutting it off almost immediately.
+let pendingEndGeneration = null;
+let endUtteranceTimer = null;
+
 function createCaptureWindow() {
   // Hidden, never shown — exists purely to host the renderer-side
   // getUserMedia/AudioWorklet capture pipeline (see renderer/audioCapture.js
@@ -163,10 +175,21 @@ function commonPrefixLength(a, b) {
  * preserves order.
  */
 let injectionChain = Promise.resolve();
-function queueInjection(work) {
-  injectionChain = injectionChain.then(work).catch((err) => {
-    console.error('Injection step failed:', err.message);
-  });
+function queueInjection(generation, work) {
+  injectionChain = injectionChain
+    .then(() => {
+      // Skip work belonging to a dictation the user has already moved past.
+      // Without this, a paste queued for utterance N could run after
+      // startDictation() reset injectedText for N+1, so it would diff against ""
+      // and re-paste N's entire transcript at the new cursor. The window is only
+      // a few milliseconds, but the result is visible garbage in the user's
+      // document, so it's worth the check.
+      if (generation !== dictationGeneration) return undefined;
+      return work();
+    })
+    .catch((err) => {
+      console.error('Injection step failed:', err.message);
+    });
   return injectionChain;
 }
 
@@ -258,13 +281,14 @@ function setupConnection() {
     // Older servers don't send sessionText; fall back so a version-skewed pair
     // still works.
     const target = sessionText != null ? sessionText : text;
-    queueInjection(() => syncInjectedText(target));
+    queueInjection(dictationGeneration, () => syncInjectedText(target));
   });
 
   currentConnection.on('polished', ({ rawText, polishedText, timings }) => {
     // `timings` is the Jetson-measured { asrFinalizeMs, touchupMs } durations
     // (see wsClient.js); null-valued against an older server.
     const timer = currentTimer;
+    const generation = dictationGeneration;
     currentTimer = null;
     if (timer) timer.markOnce('polishedReceived');
 
@@ -273,14 +297,14 @@ function setupConnection() {
       // partial text we typed so we don't strand a fragment at the cursor, then
       // stop — never error, never hang. The connection stays open for the next
       // dictation.
-      queueInjection(() => replaceInjectedText(''));
+      queueInjection(generation, () => replaceInjectedText(''));
       return;
     }
 
     // Queued behind any in-flight partial injection: a partial that arrived just
     // before the final result must finish typing before we diff against it, or
     // injectedText won't describe what's actually at the cursor.
-    queueInjection(() => replaceInjectedText(polishedText))
+    queueInjection(generation, () => replaceInjectedText(polishedText))
       .then(() => {
         if (timer) timer.markOnce('pasteDone');
         const now = Date.now();
@@ -400,21 +424,6 @@ function startDictation() {
   }
   currentConnection.beginUtterance(knownTerms);
 }
-
-// Guards the end-of-utterance handshake with the renderer. Audio is coalesced
-// into ~20ms frames, so at hotkey release there's a partial frame still buffered
-// in the renderer; it flushes that and then sends 'capture-stopped'. We wait for
-// that signal before telling the server the utterance is over, otherwise the
-// server can finalize before the tail of the last word arrives.
-//
-// The handshake is generation-tagged because it's asynchronous and the user can
-// press the hotkey again before it completes. Without the tag, releasing and
-// re-pressing inside the fallback window let the PREVIOUS dictation's pending
-// end — either the stale timer or a late 'capture-stopped' — send
-// end_of_utterance for the NEW dictation, cutting it off almost immediately.
-let dictationGeneration = 0;
-let pendingEndGeneration = null;
-let endUtteranceTimer = null;
 
 function clearPendingEnd() {
   if (endUtteranceTimer) {
