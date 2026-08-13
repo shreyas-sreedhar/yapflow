@@ -2,13 +2,20 @@
  * Yapflow — Electron main process.
  *
  * Orchestrates: global hotkey (hold-to-dictate) -> hidden renderer captures
- * mic audio -> streamed over WebSocket to the Jetson -> partial results
- * typed live at the cursor -> on hotkey release, final polished text
- * replaces the raw text via clipboard-paste.
+ * mic audio -> streamed over WebSocket to the Jetson -> partial results typed
+ * live at the cursor -> on hotkey release, the touched-up final text replaces
+ * the raw text via clipboard-paste.
  *
- * Read ../../CLAUDE.md before changing the architecture here — several
- * decisions in this file (clipboard-paste for injection, CGEventTap-backed
- * hotkey, one-connection-per-dictation) are deliberate, not defaults.
+ * Three deliberate decisions in here, none of them defaults:
+ *
+ *   - Injection is clipboard-paste plus synthetic keystrokes, never the
+ *     Accessibility API, which silently no-ops in a long tail of apps. See
+ *     lib/textInject.js.
+ *   - Replacing already-typed text uses counted backspaces, never Cmd+A.
+ *     Select-all cannot tell our own output from text the user already had in
+ *     the field, so it destroyed the latter. See syncInjectedText() below.
+ *   - The hotkey is CGEventTap-backed (uiohook) rather than Electron's
+ *     globalShortcut, which has no concept of held-vs-released. See lib/hotkey.js.
  */
 
 const { app, BrowserWindow, ipcMain, Tray, Menu, systemPreferences } = require('electron');
@@ -17,8 +24,10 @@ const path = require('path');
 const { Hotkey } = require('./lib/hotkey');
 const { DictationConnection } = require('./lib/wsClient');
 const {
-  replaceCurrentTextViaClipboardPaste,
+  warmUp: warmUpInjectHelper,
+  shutdown: shutdownInjectHelper,
   typeIncrementalDelta,
+  retractAndInject,
   getFrontmostAppBundleId,
 } = require('./lib/textInject');
 const { recordIfCorrection, getLearnedTerms, recordSession } = require('./lib/corrections');
@@ -42,7 +51,7 @@ let hotkey = null;
 
 let currentConnection = null;
 let currentTimer = null; // per-stage latency trace for the in-flight dictation (see lib/timing.js)
-let lastInjectedText = ''; // tracks live partial text WITHIN the current dictation only
+let injectedText = ''; // exactly what we have typed at the cursor in the CURRENT dictation; drives retraction
 let lastCompletedPolishedText = ''; // the polished result of the most recently FINISHED dictation, used for cross-dictation correction detection
 let lastPolishedAt = 0;
 let lastFrontmostAppBundleId = null; // bundle id of the app being dictated into; refreshed per dictation (see startDictation)
@@ -95,18 +104,127 @@ async function requestPermissions() {
   // by helpers/inject for clipboard+CGEvent operations) has to be granted
   // manually by the user in System Settings — Electron/Node can't prompt
   // for that the way it can for mic/camera. Surface a clear message if the
-  // helper fails rather than failing silently; see textInject.js's runHelper.
+  // helper's stderr is surfaced by textInject.js rather than failing silently.
   const micStatus = systemPreferences.getMediaAccessStatus('microphone');
   if (micStatus !== 'granted') {
     await systemPreferences.askForMediaAccess('microphone');
   }
 }
 
+/**
+ * Number of backspaces needed to retract `text`.
+ *
+ * Not `text.length`: that counts UTF-16 code units, while a backspace in a
+ * macOS text field deletes one grapheme cluster. An emoji, a ZWJ sequence, or a
+ * combining accent is several code units but one backspace, so using .length
+ * would over-retract and eat the user's surrounding text.
+ *
+ * Intl.Segmenter is the correct tool and is available in Electron's V8; the
+ * Array.from fallback counts code points, which is still better than code units
+ * if it's ever missing.
+ */
+function graphemeCount(text) {
+  if (!text) return 0;
+  if (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function') {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    let count = 0;
+    // eslint-disable-next-line no-unused-vars
+    for (const _segment of segmenter.segment(text)) count++;
+    return count;
+  }
+  return Array.from(text).length;
+}
+
+/**
+ * Length of the longest common prefix of two strings, measured in whole
+ * grapheme clusters so the split point never lands inside one.
+ */
+function commonPrefixLength(a, b) {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a[i] === b[i]) i++;
+  // Back off if we've split a surrogate pair, which would produce a lone
+  // surrogate on either side of the cut.
+  if (i > 0 && i < a.length) {
+    const code = a.charCodeAt(i - 1);
+    if (code >= 0xd800 && code <= 0xdbff) i--;
+  }
+  return i;
+}
+
+/**
+ * Serializes injection work.
+ *
+ * Partial results arrive faster than a round-trip to the inject helper
+ * completes, and these operations are stateful — a backspace and a type from two
+ * different updates interleaving would corrupt the text at the cursor and
+ * desync our idea of what we've typed. Chaining guarantees one at a time and
+ * preserves order.
+ */
+let injectionChain = Promise.resolve();
+function queueInjection(work) {
+  injectionChain = injectionChain.then(work).catch((err) => {
+    console.error('Injection step failed:', err.message);
+  });
+  return injectionChain;
+}
+
+/**
+ * Brings the text at the cursor in line with `target` by retracting only what
+ * diverges and typing the rest.
+ *
+ * This replaces a Cmd+A-then-paste fallback. Select-all could not distinguish
+ * our own output from text the user already had in the field, so dictating into
+ * a partially-filled field destroyed its contents. Backspacing exactly the
+ * grapheme count we typed touches nothing else.
+ *
+ * Caveat worth knowing: this assumes the cursor is still immediately after the
+ * text we typed. If the user clicks elsewhere mid-dictation, the backspaces
+ * apply at the new location. There's no way to detect that without the same
+ * unreliable Accessibility APIs we avoid for injection, and it's the same
+ * limitation every keystroke-based dictation tool has.
+ */
+async function syncInjectedText(target) {
+  if (target === injectedText) return;
+
+  const prefixLength = commonPrefixLength(injectedText, target);
+  const retractCount = graphemeCount(injectedText.slice(prefixLength));
+  const tail = target.slice(prefixLength);
+
+  if (retractCount > 0) {
+    await retractAndInject(retractCount, '');
+  }
+  if (tail) {
+    await typeIncrementalDelta(tail);
+  }
+  injectedText = target;
+}
+
+/**
+ * Final swap: replace whatever live partial text we typed with the touched-up
+ * transcript.
+ *
+ * Uses paste rather than keystrokes for the tail so the final text lands
+ * atomically. Because the touch-up is deterministic and light, the final usually
+ * shares a long prefix with the raw partials — so in practice this is a handful
+ * of backspaces plus a short paste, not a full replace.
+ */
+async function replaceInjectedText(finalText) {
+  const prefixLength = commonPrefixLength(injectedText, finalText);
+  const retractCount = graphemeCount(injectedText.slice(prefixLength));
+  const tail = finalText.slice(prefixLength);
+
+  if (retractCount > 0 || tail) {
+    await retractAndInject(retractCount, tail);
+  }
+  injectedText = finalText;
+}
+
 function startDictation() {
   // Starts the per-stage latency trace; the constructor stamps hotkeyDown
   // (≈ mic-start) immediately. See lib/timing.js.
   currentTimer = new DictationTimer();
-  lastInjectedText = '';
+  injectedText = '';
 
   // Capture which app we're dictating into, for per-app metrics and
   // personalization. Read asynchronously so we don't add a process-spawn to
@@ -131,26 +249,18 @@ function startDictation() {
 
   currentConnection = new DictationConnection(JETSON_URL, SHARED_SECRET, knownTerms);
 
-  currentConnection.on('partial', ({ text, isFinal }) => {
+  currentConnection.on('partial', ({ text, sessionText }) => {
     if (currentTimer) currentTimer.markOnce('firstPartial');
-    // Live partial injection: type only the delta since the last update,
-    // via synthetic keystrokes — NOT clipboard-paste, per CLAUDE.md
-    // Decisions section 2. The final polished replace (below, on
-    // 'polished') is what uses clipboard-paste.
-    if (text.length > lastInjectedText.length && text.startsWith(lastInjectedText)) {
-      const delta = text.slice(lastInjectedText.length);
-      typeIncrementalDelta(delta).catch((err) => {
-        console.error('Failed to type incremental delta:', err);
-      });
-    } else if (text !== lastInjectedText) {
-      // Text diverged in a way that isn't a simple append (Moonshine
-      // revised an earlier word) — fall back to a full select-all-replace
-      // rather than trying to reconcile a complex diff via keystrokes.
-      replaceCurrentTextViaClipboardPaste(text).catch((err) => {
-        console.error('Failed to replace diverged partial text:', err);
-      });
-    }
-    lastInjectedText = text;
+
+    // Use the server's cumulative sessionText, not the per-line `text`.
+    // Moonshine's events are per-line and a line ends at every natural speech
+    // pause, so `text` restarts from the beginning each time the speaker pauses
+    // — it does not grow monotonically across a dictation. Diffing against it
+    // made a mid-sentence pause wipe everything already at the cursor.
+    // Older servers don't send sessionText; fall back so a version-skewed pair
+    // still works.
+    const target = sessionText != null ? sessionText : text;
+    queueInjection(() => syncInjectedText(target));
   });
 
   currentConnection.on('polished', ({ rawText, polishedText, timings }) => {
@@ -161,15 +271,22 @@ function startDictation() {
     if (timer) timer.markOnce('polishedReceived');
 
     if (!polishedText) {
-      // No speech detected (very short utterance) — per the spec's
-      // resilience checklist, don't error or hang, just leave whatever
-      // (likely nothing) is already at the cursor.
-      currentConnection.close();
-      currentConnection = null;
+      // No speech detected, or everything said was filler. Retract any live
+      // partial text we typed so we don't strand a fragment at the cursor, then
+      // stop — never error, never hang.
+      queueInjection(() => replaceInjectedText('')).finally(() => {
+        if (currentConnection) {
+          currentConnection.close();
+          currentConnection = null;
+        }
+      });
       return;
     }
 
-    replaceCurrentTextViaClipboardPaste(polishedText)
+    // Queued behind any in-flight partial injection: a partial that arrived just
+    // before the final result must finish typing before we diff against it, or
+    // injectedText won't describe what's actually at the cursor.
+    queueInjection(() => replaceInjectedText(polishedText))
       .then(() => {
         if (timer) timer.markOnce('pasteDone');
         const now = Date.now();
@@ -184,9 +301,9 @@ function startDictation() {
         // Check whether this dictation looks like a correction of the
         // immediately-previous one, and log it to the learning store if so.
         // Compare against lastCompletedPolishedText (the previous FINISHED
-        // dictation), not lastInjectedText (which only tracks live partials
-        // within THIS dictation and would always equal polishedText itself
-        // by this point, making the comparison meaningless).
+        // dictation), not injectedText (which tracks live partials within THIS
+        // dictation and equals polishedText by this point, making the
+        // comparison meaningless).
         const diff = recordIfCorrection({
           previousPolishedText: lastCompletedPolishedText,
           currentRawText: rawText,
@@ -229,8 +346,8 @@ function startDictation() {
     // Per the spec's resilience checklist (Step 6): on a dropped
     // connection mid-dictation, leave whatever raw partial text is already
     // injected in place rather than losing it. We deliberately do nothing
-    // further here — lastInjectedText already reflects the best transcript
-    // we had before the drop.
+    // further here — injectedText already reflects the best transcript we had
+    // before the drop, and it's better at the cursor than discarded.
   });
 
   currentConnection.on('server-error', (message) => {
@@ -268,6 +385,10 @@ app.whenReady().then(async () => {
   createCaptureWindow();
   setupTray();
 
+  // Spawn the inject helper now rather than on the first dictation, so the
+  // process-start cost isn't paid inside the hotkey path.
+  warmUpInjectHelper();
+
   hotkey = new Hotkey();
   hotkey.on('hotkey-down', () => {
     captureWindow.webContents.send('hotkey-down');
@@ -291,6 +412,13 @@ ipcMain.on('audio-chunk', (event, arrayBuffer) => {
 
 ipcMain.on('renderer-error', (event, message) => {
   console.error('Renderer reported error:', message);
+});
+
+app.on('before-quit', () => {
+  // Close the helper's stdin so it exits its read loop cleanly instead of being
+  // orphaned or killed mid-clipboard-restore.
+  shutdownInjectHelper();
+  if (hotkey) hotkey.stop();
 });
 
 // Dashboard renderer asks for the aggregated metrics (see dashboard/preload.js

@@ -1,62 +1,32 @@
 /**
  * WebSocket client to the Jetson server. Opens one fresh connection per
  * dictation (hotkey-down to hotkey-up), per the protocol documented in
- * jetson-server/server.py's module docstring — this keeps session state
- * trivially scoped on both ends rather than multiplexing dictations over a
- * long-lived socket.
+ * jetson-server/server.py's module docstring.
  *
- * Wire format: matches jetson-server/server.py's EXPECT_RAW_PCM = True
- * default — this client decodes nothing and sends nothing as Opus over the
- * wire by default; instead it Opus-ENCODES on the way out only if
- * SEND_OPUS_OVER_WIRE is true below. Read the note on that flag before
- * assuming which mode is active.
+ * Wire format: raw signed 16-bit little-endian PCM, 16kHz, mono, in binary
+ * frames, interleaved with JSON control messages.
+ *
+ * There used to be an Opus encode path here behind a SEND_OPUS_OVER_WIRE flag,
+ * with a matching EXPECT_RAW_PCM flag on the server, both hand-synced to the
+ * raw-PCM setting. It's gone, for three reasons: it was never enabled, it
+ * couldn't have worked as written (the chunks handed to it were 2.6ms, and Opus
+ * only accepts 2.5/5/10/20/40/60ms frames, so encode() would have thrown), and
+ * raw 16kHz mono PCM is ~32KB/s — nothing worth compressing on a home LAN. If
+ * bandwidth ever does matter, add it deliberately with correctly-sized frames
+ * rather than reviving a flag.
  */
 
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
-// NOTE: @discordjs/opus is a NATIVE module and is required lazily (in the
-// constructor) only when SEND_OPUS_OVER_WIRE is true — see that flag below.
-// The default raw-PCM path must not depend on the native binary being built
-// for the current Electron ABI, so we deliberately do NOT require it here.
-
-const SAMPLE_RATE = 16000;
-const CHANNELS = 1;
-
-/**
- * Whether to Opus-encode audio before sending it over the wire to the
- * Jetson. The spec's original reasoning for Opus (roughly 10-20x
- * compression vs raw PCM, negligible quality loss for voice, purpose-built
- * for small real-time chunks) is about WIRE bandwidth over WiFi, not about
- * what the Jetson does internally — Moonshine wants float32 PCM either way
- * (see jetson-server/asr.py), so something has to decode Opus before it
- * reaches Moonshine.
- *
- * jetson-server/server.py defaults to EXPECT_RAW_PCM = True, meaning it
- * expects already-decoded PCM and does NOT decode Opus itself by default
- * (to keep its dependency footprint minimal). If you set this flag to
- * true here, you MUST also flip EXPECT_RAW_PCM to False on the server and
- * implement Opus decoding there (e.g. via opuslib) — otherwise the server
- * will try to interpret Opus-encoded bytes as raw int16 PCM, which will
- * produce garbage transcriptions, not an error you'll necessarily notice
- * immediately. Keep these two flags in sync across the repo.
- *
- * Given a home WiFi network (not cellular), raw 16kHz mono int16 PCM is
- * only ~32KB/sec — modest enough that skipping Opus entirely and sending
- * raw PCM is a perfectly reasonable starting point, deferring the Opus
- * encode/decode complexity until you've confirmed it's actually needed.
- * Default here is OFF for that reason; flip both flags together if you
- * want to match Wispr Flow's actual wire format more closely later.
- */
-const SEND_OPUS_OVER_WIRE = false;
 
 class DictationConnection extends EventEmitter {
   /**
    * @param {string} url - e.g. ws://jetson.local:8765
    * @param {string|null} sharedSecret
    * @param {string[]} [knownTerms] - locally-learned personal dictionary
-   *   terms (see lib/corrections.js getLearnedTerms), sent to the Jetson
-   *   in the 'start' message so the Gemma polish call can use them. See
-   *   docs/yapflow-master-plan.md Section 3.3.
+   *   terms (see lib/corrections.js getLearnedTerms), sent to the Jetson in the
+   *   'start' message, where the touch-up step uses them for whole-word
+   *   substitution.
    */
   constructor(url, sharedSecret, knownTerms = []) {
     super();
@@ -64,16 +34,6 @@ class DictationConnection extends EventEmitter {
     this._sharedSecret = sharedSecret;
     this._knownTerms = knownTerms;
     this._ws = null;
-    if (SEND_OPUS_OVER_WIRE) {
-      // Loaded only on this path: the native @discordjs/opus binary must be
-      // rebuilt for the current Electron ABI first (`npm run rebuild`). The
-      // default raw-PCM path (flag = false) avoids this native dependency
-      // entirely — see the flag's doc comment above.
-      const { OpusEncoder } = require('@discordjs/opus');
-      this._opusEncoder = new OpusEncoder(SAMPLE_RATE, CHANNELS);
-    } else {
-      this._opusEncoder = null;
-    }
     this._isOpen = false;
     this._pendingChunks = [];
   }
@@ -109,17 +69,36 @@ class DictationConnection extends EventEmitter {
 
       switch (parsed.type) {
         case 'partial':
-          this.emit('partial', { text: parsed.text, isFinal: parsed.is_final });
+          // `text` is per-line and restarts at every speech pause;
+          // `session_text` is cumulative across the whole dictation. Callers
+          // injecting at a cursor want session_text — see main.js. It's absent
+          // on older servers, hence the null.
+          this.emit('partial', {
+            text: parsed.text,
+            isFinal: parsed.is_final,
+            lineIndex: parsed.line_index ?? null,
+            sessionText: parsed.session_text ?? null,
+          });
           break;
         case 'polished': {
           // Server-measured stage durations (see jetson-server/server.py).
           // Mapped to the camelCase shape lib/timing.js merges into the trace;
           // absent on older servers, in which case these stay undefined/null.
+          //
+          // touchup_ms is the current name for what used to be gemma_ms, back
+          // when the touch-up was an LLM call. The server still emits gemma_ms
+          // as a deprecated alias; prefer touchup_ms and fall back, so this
+          // works against a server on either side of that change.
           const t = parsed.timings || {};
+          const touchupMs = t.touchup_ms ?? t.gemma_ms ?? null;
           this.emit('polished', {
             rawText: parsed.raw_text,
             polishedText: parsed.polished_text,
-            timings: { asrFinalizeMs: t.asr_finalize_ms ?? null, gemmaMs: t.gemma_ms ?? null },
+            timings: {
+              asrFinalizeMs: t.asr_finalize_ms ?? null,
+              touchupMs,
+              gemmaMs: touchupMs, // deprecated alias, kept for the metrics schema
+            },
           });
           break;
         }
@@ -146,12 +125,10 @@ class DictationConnection extends EventEmitter {
   }
 
   /**
-   * Feed a chunk of int16 PCM audio (as a Buffer/ArrayBuffer) in. Encodes
-   * to Opus first if SEND_OPUS_OVER_WIRE is true, otherwise sends as-is.
+   * Feed a chunk of int16 PCM audio (as a Buffer/ArrayBuffer) in, as-is.
    */
   sendAudioChunk(int16Buffer) {
-    const buf = Buffer.isBuffer(int16Buffer) ? int16Buffer : Buffer.from(int16Buffer);
-    const outgoing = this._opusEncoder ? this._opusEncoder.encode(buf) : buf;
+    const outgoing = Buffer.isBuffer(int16Buffer) ? int16Buffer : Buffer.from(int16Buffer);
 
     if (this._isOpen) {
       this._ws.send(outgoing);
