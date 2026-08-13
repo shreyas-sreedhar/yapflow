@@ -61,6 +61,11 @@ PCM_SAMPLE_RATE = 16000
 # dictation.
 FINALIZE_TIMEOUT_SECONDS = 0.25
 
+# Sentinel enqueued to tell results() there are no more results coming, so the
+# forwarding task can finish on its own instead of being cancelled out from under
+# a queue that still has partials in it.
+_RESULTS_DONE = object()
+
 
 def get_transcriber() -> Transcriber:
     """
@@ -254,6 +259,17 @@ class StreamingSession:
         float32 in the range -1.0..1.0, so we convert here rather than
         pushing that conversion onto the websocket handler.
         """
+        # np.frombuffer raises on a buffer that isn't a whole number of int16s.
+        # A truncated frame is a network artifact, not a reason to kill the
+        # dictation — drop the trailing odd byte and keep going.
+        if len(pcm_int16_bytes) % 2 != 0:
+            logger.warning(
+                "Dropping trailing odd byte from a %d-byte PCM frame", len(pcm_int16_bytes)
+            )
+            pcm_int16_bytes = pcm_int16_bytes[:-1]
+        if not pcm_int16_bytes:
+            return
+
         int16_array = np.frombuffer(pcm_int16_bytes, dtype=np.int16)
         float_array = (int16_array.astype(np.float32)) / 32768.0
         self._stream.add_audio(float_array, PCM_SAMPLE_RATE)
@@ -264,10 +280,30 @@ class StreamingSession:
         them. Iterate this concurrently with feeding audio in (e.g. via
         asyncio.gather or two tasks) — don't await it in a way that blocks
         new audio from being fed, since that defeats the point of streaming.
+
+        Terminates cleanly when signal_results_done() is called, which is how the
+        caller drains the last few results instead of cancelling mid-queue.
         """
         while True:
             result = await self._queue.get()
+            if result is _RESULTS_DONE:
+                return
             yield result
+
+    def signal_results_done(self) -> None:
+        """
+        Marks the end of the result stream so results() can finish naturally.
+
+        Call this AFTER finalize(), so the final on_line_completed that stop()
+        fires is already in the queue and gets forwarded ahead of the sentinel.
+        Cancelling the forwarding task instead — which is what used to happen —
+        discarded every result still queued, so the client's live partial text
+        silently stopped updating near the end of each dictation.
+        """
+        try:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, _RESULTS_DONE)
+        except RuntimeError:
+            pass
 
     def finalize(self) -> str:
         """

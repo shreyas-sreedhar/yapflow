@@ -12,6 +12,12 @@ contextBridge.exposeInMainWorld('flowLocal', {
   // ArrayBuffer. Sent continuously while the hotkey is held.
   sendAudioChunk: (arrayBuffer) => ipcRenderer.send('audio-chunk', arrayBuffer),
 
+  // Renderer -> Main: capture has stopped and the final (possibly short)
+  // audio frame has been handed over. main.js waits for this before sending
+  // end_of_utterance, so the server doesn't finalize the transcript before the
+  // tail of the last word reaches it.
+  notifyCaptureStopped: () => ipcRenderer.send('capture-stopped'),
+
   // Renderer -> Main: something went wrong capturing audio (e.g. mic
   // permission denied). Surfaced so main.js can show it in the tray /
   // notify the user rather than failing silently.

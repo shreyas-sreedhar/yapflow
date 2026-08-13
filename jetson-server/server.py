@@ -1,43 +1,61 @@
 """
 Yapflow Jetson WebSocket server.
 
-Protocol (JSON control messages interleaved with binary Opus frames, on one
-persistent connection per dictation):
+One connection per dictation, carrying JSON control messages interleaved with
+binary audio frames.
+
+AUDIO WIRE FORMAT: raw signed 16-bit little-endian PCM, 16kHz, mono, ~20ms
+(640 bytes) per frame. Not Opus. Earlier versions of this docstring described an
+Opus protocol behind an EXPECT_RAW_PCM flag, with a matching flag on the Mac —
+both permanently set to raw PCM, and the Opus path could not have worked anyway
+(the client handed it 2.6ms chunks, and Opus only accepts 2.5/5/10/20/40/60ms
+frames). Both flags are gone. At ~32KB/s there is nothing worth compressing on a
+LAN; if that changes, add it deliberately with correctly-sized frames.
+
+The sample rate is NOT negotiated — it's fixed on both sides (asr.py's
+PCM_SAMPLE_RATE and the Mac's TARGET_SAMPLE_RATE). A client sending a different
+rate gets silently mis-transcribed rather than an error.
 
   Mac -> Jetson, on hotkey press:
-    {"type": "start", "secret": "<optional shared secret>", "known_terms": ["term1", "term2", ...]}
-    (known_terms is the Mac's locally-learned personal dictionary, per
-    docs/yapflow-master-plan.md Section 3.3 — optional, defaults to
-    empty if omitted)
+    {"type": "start", "secret": "<optional shared secret>", "known_terms": [...]}
+    known_terms is the Mac's locally-learned personal dictionary (see its
+    lib/corrections.js getLearnedTerms); the touch-up step uses it for whole-word
+    substitution. Optional, defaults to empty.
 
-  Mac -> Jetson, continuously while hotkey held:
-    binary frame: one Opus-encoded audio packet (20-50ms of audio)
+  Mac -> Jetson, continuously while the hotkey is held:
+    binary frame: raw PCM16 audio as described above
 
   Mac -> Jetson, on hotkey release:
     {"type": "end_of_utterance"}
 
-  Jetson -> Mac, as Moonshine produces partial/final transcript lines:
-    {"type": "partial", "text": "...", "is_final": false}
-    {"type": "partial", "text": "...", "is_final": true}
+  Mac -> Jetson, any time:
+    {"type": "ping"}   -> {"type": "pong"}   (health check without dictating)
 
-  Jetson -> Mac, once Gemma has polished the final transcript:
+  Jetson -> Mac, as Moonshine produces transcript updates:
+    {"type": "partial", "text": "...", "is_final": <bool>,
+     "line_index": <int>, "session_text": "..."}
+
+    IMPORTANT: `text` is the text of ONE LINE. Moonshine segments on natural
+    speech pauses, so when the speaker pauses, the current line completes and the
+    next event starts a new line back at the beginning — `text` does NOT grow
+    monotonically across a dictation. A client injecting at a cursor must use
+    `session_text`, which is every line joined and does grow. Diffing against
+    `text` is how a mid-sentence pause used to wipe already-injected text.
+
+  Jetson -> Mac, once the transcript has been touched up:
     {"type": "polished", "raw_text": "...", "polished_text": "...",
-     "timings": {"asr_finalize_ms": <int>, "gemma_ms": <int>}}
-    (timings are server-measured DURATIONS, not timestamps — the Mac merges
-    them into its own per-stage latency trace by value, never by wall-clock,
-    since the two machines' clocks aren't synced. See the Mac's
-    mac-app/src/lib/timing.js and docs/yapflow-master-plan.md Section 4.)
+     "timings": {"asr_finalize_ms": <int>, "touchup_ms": <int>, "gemma_ms": <int>}}
 
-  Jetson -> Mac, on any server-side error during a session:
+    timings are server-measured DURATIONS, never timestamps: the two machines'
+    clocks aren't synced, so the Mac merges them into its own per-stage trace by
+    value (see the Mac's lib/timing.js). `gemma_ms` is a deprecated alias for
+    `touchup_ms`, kept while the Mac app catches up — the touch-up stopped being
+    an LLM call.
+
+  Jetson -> Mac, on a server-side error during a session:
     {"type": "error", "message": "..."}
-
-This module deliberately does NOT decode Opus itself by default — see the
-OPUS_DECODE_ON_SERVER flag below. Decoding on the Mac client and sending raw
-PCM is simpler and keeps this server's dependency footprint small, but Opus
-is kept as the wire format either way (per the spec's reasoning on why Opus
-matters for bandwidth/latency over WiFi). If you DO want to decode Opus here
-instead, set OPUS_DECODE_ON_SERVER = True and ensure `opuslib` (or another
-Opus binding) is installed — see requirements.txt.
+    Note the transcript is still delivered after this; the touch-up falls back to
+    the raw transcript rather than dropping the user's words.
 """
 
 from __future__ import annotations
@@ -57,12 +75,11 @@ from polish import polish
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("yapflow.server")
 
-# If True, this server expects raw PCM (int16, 16kHz, mono) binary frames
-# instead of Opus-encoded frames, and skips decoding entirely. Flip this
-# based on whether you decide to decode Opus on the Mac (simpler Jetson
-# deps) or here (smaller Mac app, more Jetson deps). Default: Mac decodes,
-# matching "keep the Jetson server surface minimal" from CLAUDE.md.
-EXPECT_RAW_PCM = True
+# How long to wait for the result-forwarding task to flush the last queued
+# partials after an utterance ends. These are already-computed results going out
+# over an open socket, so this should complete in single-digit milliseconds; the
+# ceiling only exists so a stalled send can't hold the dictation open.
+RESULT_DRAIN_TIMEOUT_SECONDS = 1.0
 
 
 def _timings(asr_finalize_ms: int, touchup_ms: "int | None") -> dict:
@@ -83,44 +100,130 @@ def _timings(asr_finalize_ms: int, touchup_ms: "int | None") -> dict:
 
 async def _handle_session(websocket: WebSocketServerProtocol) -> None:
     """
-    One call of this function = one dictation session = one WebSocket
-    connection lifecycle. The Mac client is expected to open a fresh
-    connection per dictation (hotkey press to hotkey release), not keep one
-    long-lived socket across multiple dictations — this keeps session state
-    (the ASR Stream) trivially scoped and avoids any cross-dictation state
-    bugs.
+    One call of this function = one WebSocket connection, carrying one OR MANY
+    dictations.
+
+    The connection used to be the dictation: the Mac opened a fresh socket on
+    every hotkey press, which put a TCP connect, a WebSocket handshake, and an
+    auth round-trip in the hot path before the first audio byte could flow. No
+    audio was lost (the client buffers pre-connect), but the ASR couldn't begin
+    incremental work until the socket was up, so it received a burst instead of a
+    stream — eroding exactly the property Moonshine is chosen for, worst on the
+    short utterances where latency is most noticeable.
+
+    Now the client connects once at app start and keeps the socket warm.
+
+    Two client shapes are accepted so the Mac app and the server can be rolled
+    independently:
+
+      NEW: {"type":"hello"} once, then {"type":"start_utterance"} / audio /
+           {"type":"end_of_utterance"} per dictation, connection stays open.
+      OLD: {"type":"start"} then audio then {"type":"end_of_utterance"}, one
+           dictation, connection closes. Treated as hello + start_utterance.
     """
-    if config.SHARED_SECRET:
-        # The first message on every connection must be the start control
-        # message carrying the shared secret, if one is configured.
-        try:
-            first_raw = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-        except asyncio.TimeoutError:
-            await websocket.close(code=4001, reason="auth timeout")
-            return
+    handshake = await _authenticate(websocket)
+    if handshake is None:
+        return
 
-        try:
-            first_msg = json.loads(first_raw)
-        except (json.JSONDecodeError, TypeError):
-            await websocket.close(code=4002, reason="expected JSON start message")
-            return
+    known_terms, legacy_single_shot = handshake
 
-        if first_msg.get("type") != "start" or first_msg.get("secret") != config.SHARED_SECRET:
-            logger.warning("Rejected connection: bad or missing shared secret")
-            await websocket.close(code=4003, reason="unauthorized")
-            return
-        known_terms = first_msg.get("known_terms", [])
-    else:
-        # No secret configured — still expect (and discard) a start message
-        # for protocol consistency, but don't enforce a token.
-        try:
-            first_raw = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-            first_msg = json.loads(first_raw)  # validate it's well-formed JSON
-        except (asyncio.TimeoutError, json.JSONDecodeError, TypeError):
-            await websocket.close(code=4002, reason="expected JSON start message")
-            return
-        known_terms = first_msg.get("known_terms", []) if isinstance(first_msg, dict) else []
+    if legacy_single_shot:
+        # An old client's "start" both authenticated and opened the utterance.
+        await _run_utterance(websocket, known_terms)
+        return
 
+    # Persistent mode: sit on the connection and run an utterance each time the
+    # client opens one.
+    try:
+        async for message in websocket:
+            if isinstance(message, (bytes, bytearray)):
+                # Audio outside an utterance. Can arrive if the client races
+                # hotkey-down against its own start_utterance; ignore rather than
+                # erroring, since the client will resend once the utterance opens.
+                logger.debug("Ignoring %d bytes of audio outside an utterance", len(message))
+                continue
+
+            try:
+                control = json.loads(message)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Ignoring malformed control message: %r", message)
+                continue
+
+            control_type = control.get("type")
+            if control_type == "start_utterance":
+                # Terms can be refreshed per utterance; the personal dictionary
+                # grows as the user corrects things.
+                if "known_terms" in control:
+                    known_terms = control.get("known_terms") or []
+                await _run_utterance(websocket, known_terms)
+            elif control_type == "ping":
+                await websocket.send(json.dumps({"type": "pong"}))
+            elif control_type == "end_of_utterance":
+                # Stray end without a start. Harmless.
+                logger.debug("Ignoring end_of_utterance outside an utterance")
+            else:
+                logger.warning("Ignoring unrecognized control message type: %r", control_type)
+    except websockets.exceptions.ConnectionClosed:
+        logger.info("Client disconnected")
+
+
+async def _authenticate(websocket: WebSocketServerProtocol):
+    """
+    Read and validate the first message on a connection.
+
+    Returns (known_terms, legacy_single_shot), or None if the connection was
+    rejected and closed.
+
+    Close codes: 4001 handshake timeout, 4002 non-JSON handshake, 4003
+    unauthorized.
+
+    The timeout is generous because in persistent mode a client connects at app
+    start and may not dictate for hours — but the HANDSHAKE itself still arrives
+    immediately on connect, so a short window is fine and keeps half-open
+    connections from accumulating.
+    """
+    try:
+        first_raw = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+    except asyncio.TimeoutError:
+        await websocket.close(code=4001, reason="handshake timeout")
+        return None
+    except websockets.exceptions.ConnectionClosed:
+        return None
+
+    try:
+        first_msg = json.loads(first_raw)
+    except (json.JSONDecodeError, TypeError):
+        await websocket.close(code=4002, reason="expected a JSON handshake message")
+        return None
+
+    if not isinstance(first_msg, dict):
+        await websocket.close(code=4002, reason="expected a JSON object")
+        return None
+
+    msg_type = first_msg.get("type")
+    if msg_type not in ("hello", "start"):
+        await websocket.close(code=4002, reason="expected 'hello' or 'start'")
+        return None
+
+    if config.SHARED_SECRET and first_msg.get("secret") != config.SHARED_SECRET:
+        logger.warning("Rejected connection: bad or missing shared secret")
+        await websocket.close(code=4003, reason="unauthorized")
+        return None
+
+    known_terms = first_msg.get("known_terms") or []
+    # "start" is the old one-connection-per-dictation shape.
+    return known_terms, msg_type == "start"
+
+
+async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) -> None:
+    """
+    One dictation: feed audio until end_of_utterance, then finalize, touch up,
+    and send the result back.
+
+    Returns normally when the utterance completes. Re-raises ConnectionClosed so
+    the caller's loop can exit — but only after finalizing, so the ASR stream is
+    never leaked.
+    """
     session = StreamingSession()
     logger.info("Dictation session started")
 
@@ -147,18 +250,8 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
     try:
         async for message in websocket:
             if isinstance(message, (bytes, bytearray)):
-                # An audio frame. EXPECT_RAW_PCM controls whether this is
-                # already-decoded PCM or still-Opus-encoded — see module
-                # docstring. If you switch to server-side Opus decode, this
-                # is the line to change (decode, then feed_pcm_int16).
-                if EXPECT_RAW_PCM:
-                    session.feed_pcm_int16(message)
-                else:
-                    raise NotImplementedError(
-                        "Server-side Opus decoding not enabled — set "
-                        "EXPECT_RAW_PCM=False and implement decode here, or "
-                        "decode on the Mac client instead (recommended)."
-                    )
+                # An audio frame: raw PCM16, 16kHz, mono. See module docstring.
+                session.feed_pcm_int16(message)
                 continue
 
             # A JSON control message.
@@ -168,22 +261,24 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
                 logger.warning("Ignoring malformed control message: %r", message)
                 continue
 
-            if control.get("type") == "end_of_utterance":
+            control_type = control.get("type")
+            if control_type == "end_of_utterance":
                 break
+            elif control_type == "ping":
+                await websocket.send(json.dumps({"type": "pong"}))
             else:
-                logger.warning("Ignoring unrecognized control message type: %r", control.get("type"))
+                logger.warning("Ignoring unrecognized control message type: %r", control_type)
 
     except websockets.exceptions.ConnectionClosed:
         logger.info("Connection closed by client mid-dictation (network drop?)")
-        # If the connection drops mid-dictation there's nobody left to send the
-        # transcript to, so we just tear down. The Mac client is responsible for
-        # leaving whatever raw partial text it already injected in place rather
-        # than losing it — see macos-app/src/lib/wsClient.js.
+        # Nobody left to send the transcript to, so tear down. The Mac client is
+        # responsible for leaving whatever raw partial text it already injected in
+        # place rather than losing it — see macos-app/src/lib/wsClient.js.
         #
-        # finalize() must still run even though we discard its result: it's what
-        # calls _stream.stop(), and without it the Moonshine stream and its
-        # thread leak for the lifetime of the process. This path used to call
-        # close() alone, which only removes the listener.
+        # finalize() must still run even though its result is discarded: it's what
+        # calls _stream.stop(), and without it the Moonshine stream and its thread
+        # leak for the lifetime of the process. This path used to call close()
+        # alone, which only removes the listener.
         forward_task.cancel()
         try:
             session.finalize()
@@ -191,17 +286,33 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
             logger.exception("Error finalizing ASR session after connection drop")
         finally:
             session.close()
-        return
+        raise
 
-    # Hotkey released (or connection ended cleanly): finalize ASR, run the
-    # deterministic touch-up, send the result back. We time each stage
-    # (monotonic perf_counter) so the Mac can attribute post-release latency
-    # to ASR vs. touch-up — see macos-app/src/lib/timing.js.
-    forward_task.cancel()
+    # Hotkey released: finalize ASR, run the deterministic touch-up, send the
+    # result back. We time each stage (monotonic perf_counter) so the Mac can
+    # attribute post-release latency to ASR vs. touch-up — see
+    # macos-app/src/lib/timing.js.
+    #
+    # Note the ORDER here. finalize() first, so stop()'s final events are queued;
+    # then the sentinel; then await the forwarding task so it drains everything
+    # still pending. Cancelling the task first — which is what this used to do —
+    # threw away every queued partial, so the client's live text silently stopped
+    # updating near the end of every dictation.
     _t_finalize_start = time.perf_counter()
-    raw_text = session.finalize()
-    session.close()
+    try:
+        raw_text = session.finalize()
+    finally:
+        session.close()
     asr_finalize_ms = round((time.perf_counter() - _t_finalize_start) * 1000)
+
+    session.signal_results_done()
+    try:
+        await asyncio.wait_for(forward_task, timeout=RESULT_DRAIN_TIMEOUT_SECONDS)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # Bounded: a stuck send must not hold the dictation open.
+        forward_task.cancel()
+    except websockets.exceptions.ConnectionClosed:
+        pass
 
     if not raw_text.strip():
         # Very short utterance, or no speech detected. Per the spec's

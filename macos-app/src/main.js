@@ -220,34 +220,17 @@ async function replaceInjectedText(finalText) {
   injectedText = finalText;
 }
 
-function startDictation() {
-  // Starts the per-stage latency trace; the constructor stamps hotkeyDown
-  // (≈ mic-start) immediately. See lib/timing.js.
-  currentTimer = new DictationTimer();
-  injectedText = '';
-
-  // Capture which app we're dictating into, for per-app metrics and
-  // personalization. Read asynchronously so we don't add a process-spawn to
-  // the hotkey-down hot path — it resolves long before the session is
-  // recorded (on 'polished'). The knownTerms lookup below may use the prior
-  // value; getLearnedTerms tolerates that (it always includes app-agnostic
-  // terms too), so the only cost is a marginally-less-targeted term list on
-  // the very first dictation into a newly-focused app.
-  getFrontmostAppBundleId()
-    .then((id) => {
-      lastFrontmostAppBundleId = id;
-    })
-    .catch(() => {});
-
-  // Personal-dictionary learning loop (see CLAUDE.md Decisions section 5 /
-  // docs/yapflow-master-plan.md Section 3.3): pull the locally-learned
-  // terms relevant to the current frontmost app (if known) and send them
-  // to the Jetson so the Gemma polish call can use them. This is a plain
-  // word-list consulted at inference time, not fine-tuning — see the
-  // master plan for why that distinction matters.
-  const knownTerms = getLearnedTerms({ appBundleId: lastFrontmostAppBundleId });
-
-  currentConnection = new DictationConnection(JETSON_URL, SHARED_SECRET, knownTerms);
+/**
+ * Creates the persistent connection to the Jetson and attaches its handlers.
+ *
+ * Called once at app start, not per dictation. The connection used to be built
+ * on hotkey-down, which put a TCP connect and handshake in the hot path; now
+ * hotkey-down is just a control message on an already-open socket. Handlers live
+ * here rather than in startDictation() so they're registered exactly once —
+ * re-attaching per dictation on a long-lived emitter would leak listeners.
+ */
+function setupConnection() {
+  currentConnection = new DictationConnection(JETSON_URL, SHARED_SECRET);
 
   currentConnection.on('partial', ({ text, sessionText }) => {
     if (currentTimer) currentTimer.markOnce('firstPartial');
@@ -264,22 +247,18 @@ function startDictation() {
   });
 
   currentConnection.on('polished', ({ rawText, polishedText, timings }) => {
-    // `timings` is the Jetson-measured { asrFinalizeMs, gemmaMs } durations,
-    // present once the server side reports them (see wsClient.js); harmless
-    // and null-valued until then.
+    // `timings` is the Jetson-measured { asrFinalizeMs, touchupMs } durations
+    // (see wsClient.js); null-valued against an older server.
     const timer = currentTimer;
+    currentTimer = null;
     if (timer) timer.markOnce('polishedReceived');
 
     if (!polishedText) {
       // No speech detected, or everything said was filler. Retract any live
       // partial text we typed so we don't strand a fragment at the cursor, then
-      // stop — never error, never hang.
-      queueInjection(() => replaceInjectedText('')).finally(() => {
-        if (currentConnection) {
-          currentConnection.close();
-          currentConnection = null;
-        }
-      });
+      // stop — never error, never hang. The connection stays open for the next
+      // dictation.
+      queueInjection(() => replaceInjectedText(''));
       return;
     }
 
@@ -321,8 +300,12 @@ function startDictation() {
           releaseToPolishedMs: t.releaseToPolishedMs ?? null,
           pasteMs: t.pasteMs ?? null,
           asrFinalizeMs: t.asrFinalizeMs ?? null,
-          gemmaMs: t.gemmaMs ?? null,
-          asrPath: 'B', // Path B per CLAUDE.md architecture decision
+          // The DB column is still named gemma_ms; the value is now the
+          // deterministic touch-up's duration. Renaming the column would need a
+          // migration and would break the existing dashboard queries, so the
+          // name stays and touchupMs feeds it.
+          gemmaMs: t.touchupMs ?? t.gemmaMs ?? null,
+          asrPath: 'B',
           appBundleId: lastFrontmostAppBundleId,
           hadFollowupCorrection: Boolean(diff),
         });
@@ -332,38 +315,101 @@ function startDictation() {
       })
       .catch((err) => {
         console.error('Failed to inject polished text:', err);
-      })
-      .finally(() => {
-        if (currentConnection) {
-          currentConnection.close();
-          currentConnection = null;
-        }
       });
+    // Note: no connection teardown here. The socket is long-lived now and stays
+    // open for the next dictation.
   });
 
   currentConnection.on('error', (err) => {
     console.error('Jetson connection error:', err.message);
-    // Per the spec's resilience checklist (Step 6): on a dropped
-    // connection mid-dictation, leave whatever raw partial text is already
-    // injected in place rather than losing it. We deliberately do nothing
-    // further here — injectedText already reflects the best transcript we had
-    // before the drop, and it's better at the cursor than discarded.
+    // On a drop mid-dictation, leave whatever raw partial text is already
+    // injected in place rather than losing it — injectedText holds the best
+    // transcript we had, and it's more useful at the cursor than discarded.
+    // Reconnection is wsClient's job; nothing to do here.
   });
 
   currentConnection.on('server-error', (message) => {
     console.error('Jetson server reported an error:', message);
   });
 
-  currentConnection.connect();
+  currentConnection.on('open', () => {
+    console.log(`Connected to Jetson at ${JETSON_URL}`);
+  });
+
+  currentConnection.on('close', ({ code }) => {
+    console.warn(`Jetson connection closed (code=${code}); will reconnect if transient`);
+  });
+
+  currentConnection.start();
 }
 
-function endDictation() {
-  // end-of-speech: stamp it before signalling the server so the
-  // release→polished and release→text deltas measure from the true release.
-  if (currentTimer) currentTimer.markOnce('hotkeyUp');
+function startDictation() {
+  // Starts the per-stage latency trace; the constructor stamps hotkeyDown
+  // (≈ mic-start) immediately. See lib/timing.js.
+  currentTimer = new DictationTimer();
+  injectedText = '';
+
+  // Capture which app we're dictating into, for per-app metrics and
+  // personalization. Read asynchronously so we don't add a round-trip to the
+  // hotkey-down hot path — it resolves long before the session is recorded (on
+  // 'polished'). The knownTerms lookup below may use the prior value;
+  // getLearnedTerms tolerates that (it always includes app-agnostic terms too),
+  // so the only cost is a marginally-less-targeted term list on the very first
+  // dictation into a newly-focused app.
+  getFrontmostAppBundleId()
+    .then((id) => {
+      lastFrontmostAppBundleId = id;
+    })
+    .catch(() => {});
+
+  // Personal-dictionary learning loop: pull the locally-learned terms relevant
+  // to the current frontmost app and send them to the Jetson, where the touch-up
+  // step uses them for whole-word substitution. A word-list consulted at
+  // inference time, not fine-tuning.
+  const knownTerms = getLearnedTerms({ appBundleId: lastFrontmostAppBundleId });
+
+  if (!currentConnection) {
+    console.error('No Jetson connection; dropping dictation');
+    return;
+  }
+  if (!currentConnection.isConnected) {
+    // Audio is still captured and buffered in wsClient, so a reconnect that
+    // lands mid-utterance can still deliver it.
+    console.warn('Jetson not connected yet; buffering this dictation');
+  }
+  currentConnection.beginUtterance(knownTerms);
+}
+
+// Guards the end-of-utterance handshake with the renderer. Audio is coalesced
+// into ~20ms frames, so at hotkey release there's a partial frame still buffered
+// in the renderer; it flushes that and then sends 'capture-stopped'. We wait for
+// that signal before telling the server the utterance is over, otherwise the
+// server can finalize before the tail of the last word arrives.
+let endUtteranceTimer = null;
+
+function sendEndUtterance() {
+  if (endUtteranceTimer) {
+    clearTimeout(endUtteranceTimer);
+    endUtteranceTimer = null;
+  }
   if (currentConnection) {
     currentConnection.endUtterance();
   }
+}
+
+function endDictation() {
+  // Stamp end-of-speech before anything else, so release→polished and
+  // release→text measure from the true release rather than from the handshake.
+  if (currentTimer) currentTimer.markOnce('hotkeyUp');
+
+  // Fallback: if the renderer never reports back (capture failed to start, mic
+  // permission denied, renderer crashed), still end the utterance rather than
+  // leaving the dictation hanging. The wait should normally be ~1ms.
+  endUtteranceTimer = setTimeout(() => {
+    console.warn('Renderer did not report capture-stopped; ending utterance anyway');
+    endUtteranceTimer = null;
+    sendEndUtterance();
+  }, 150);
 }
 
 function setupTray() {
@@ -385,9 +431,11 @@ app.whenReady().then(async () => {
   createCaptureWindow();
   setupTray();
 
-  // Spawn the inject helper now rather than on the first dictation, so the
-  // process-start cost isn't paid inside the hotkey path.
+  // Spawn the inject helper and open the Jetson socket now rather than on the
+  // first dictation, so neither the process start nor the WebSocket handshake is
+  // paid inside the hotkey path.
   warmUpInjectHelper();
+  setupConnection();
 
   hotkey = new Hotkey();
   hotkey.on('hotkey-down', () => {
@@ -410,6 +458,11 @@ ipcMain.on('audio-chunk', (event, arrayBuffer) => {
   }
 });
 
+ipcMain.on('capture-stopped', () => {
+  // The renderer has flushed its last audio frame; now it's safe to finalize.
+  sendEndUtterance();
+});
+
 ipcMain.on('renderer-error', (event, message) => {
   console.error('Renderer reported error:', message);
 });
@@ -418,6 +471,12 @@ app.on('before-quit', () => {
   // Close the helper's stdin so it exits its read loop cleanly instead of being
   // orphaned or killed mid-clipboard-restore.
   shutdownInjectHelper();
+  if (currentConnection) {
+    // stop(), not close() — this suppresses the reconnect timer so we don't
+    // schedule a retry on the way out.
+    currentConnection.stop();
+    currentConnection = null;
+  }
   if (hotkey) hotkey.stop();
 });
 
