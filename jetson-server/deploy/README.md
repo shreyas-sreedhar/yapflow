@@ -183,9 +183,15 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 
 ## Tests
 
-Neither suite needs a model, a GPU, or a Jetson — the ASR library is stubbed:
+None of these need a model, a GPU, or a Jetson — the ASR library is stubbed:
 
 ```bash
+python3 test_polish.py             # touch-up rules
 python3 test_asr_accumulation.py   # transcript accumulator
 python3 test_protocol.py           # real server, real WebSocket client
 ```
+
+The Mac app's suites (`cd ../../macos-app && npm test`) cover the retraction
+arithmetic and the streaming resampler. `helpers/inject.swift` has no automated
+coverage — it needs macOS and AppKit to build, so verify it by hand with
+`npm run build-helper` and the checks in the repo's verification notes.
