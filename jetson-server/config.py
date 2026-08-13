@@ -19,44 +19,23 @@ PORT = int(os.environ.get("YAPFLOW_PORT", "8765"))
 SHARED_SECRET = os.environ.get("YAPFLOW_SECRET", None)
 
 # --- ASR (Moonshine v2 streaming) ---
-# One of: TINY_STREAMING, SMALL_STREAMING, MEDIUM_STREAMING
-# SMALL_STREAMING is the recommended default for live apps (123M params,
-# 7.84% WER) — a reasonable balance of accuracy and footprint on an 8GB
-# Jetson that's also running Gemma 3 4B alongside it.
+# One of: TINY_STREAMING, SMALL_STREAMING, MEDIUM_STREAMING.
+#
+# SMALL_STREAMING (123M params, 7.84% WER) was chosen when this box also had to
+# host Gemma 3 4B. That constraint is gone — the LLM polish step was removed, so
+# there's roughly 3-4GB of unified memory free. MEDIUM_STREAMING (245M params,
+# 6.65% WER, better than Whisper Large v3) is now affordable and is worth
+# A/B-ing against this default: flip the env var, restart, and compare
+# asr_finalize_ms p95 and WER-by-eye on the same set of utterances.
+#
+# A typo here is a hard error, not a silent fallback — see asr.py.
 MOONSHINE_MODEL_ARCH = os.environ.get("YAPFLOW_ASR_MODEL", "SMALL_STREAMING")
 
 # How often Moonshine emits incremental transcript updates while audio is
 # still streaming in. Shorter = more responsive partial text, more compute.
-ASR_UPDATE_INTERVAL_SECONDS = 0.3
-
-# --- LLM polish step (Ollama) ---
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-
-# IMPORTANT: check `ollama list` / ollama.com/library/gemma3 for a -qat
-# tagged variant before assuming this default is the most memory-efficient
-# choice available — see CLAUDE.md Decisions section.
-OLLAMA_MODEL = os.environ.get("YAPFLOW_LLM_MODEL", "gemma3:4b")
-
-# Keep this small and deliberate. The polish prompt is short (raw transcript
-# + a handful of learned dictionary terms + instructions) — there is no
-# reason to run a large context window for this. See CLAUDE.md Decisions
-# section 8 for why this matters on 8GB unified memory.
-OLLAMA_NUM_CTX = int(os.environ.get("YAPFLOW_NUM_CTX", "1024"))
-
-# Keep the model resident between requests. Do NOT set this to a short
-# duration that causes Ollama to unload/reload the model — see CLAUDE.md
-# Decisions section 9 on CMA fragmentation from repeated load/unload cycles.
-#
-# Ollama's API treats a STRING keep_alive as a Go duration ("5m", "1h"), and
-# a NUMBER as seconds where a negative value means "forever". So "-1" as a
-# string is invalid ('missing unit in duration "-1"') — it must be the int
-# -1. Coerce plain integers to int here so the common "-1"/seconds cases
-# work, while still allowing duration strings like "5m" to pass through.
-_keep_alive_raw = os.environ.get("YAPFLOW_KEEP_ALIVE", "-1")
-try:
-    OLLAMA_KEEP_ALIVE = int(_keep_alive_raw)  # seconds; -1 = keep resident forever
-except ValueError:
-    OLLAMA_KEEP_ALIVE = _keep_alive_raw  # e.g. "5m", "1h" — a Go duration string
+# Because the streaming models do most of their work as audio arrives, this
+# mostly affects how often live partial text refreshes, not final latency.
+ASR_UPDATE_INTERVAL_SECONDS = float(os.environ.get("YAPFLOW_ASR_UPDATE_INTERVAL", "0.3"))
 
 # --- Logging ---
 LOG_LEVEL = os.environ.get("YAPFLOW_LOG_LEVEL", "INFO")

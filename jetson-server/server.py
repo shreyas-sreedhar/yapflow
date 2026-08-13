@@ -52,7 +52,7 @@ from websockets.server import WebSocketServerProtocol
 
 import config
 from asr import StreamingSession, get_transcriber
-from polish import ensure_model_ready, polish
+from polish import polish
 
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("yapflow.server")
@@ -63,6 +63,22 @@ logger = logging.getLogger("yapflow.server")
 # deps) or here (smaller Mac app, more Jetson deps). Default: Mac decodes,
 # matching "keep the Jetson server surface minimal" from CLAUDE.md.
 EXPECT_RAW_PCM = True
+
+
+def _timings(asr_finalize_ms: int, touchup_ms: "int | None") -> dict:
+    """
+    Build the server-measured durations block.
+
+    `gemma_ms` is emitted as a deprecated alias for `touchup_ms` so the Mac's
+    existing metrics dashboard and the `gemma_ms` column in its SQLite sessions
+    table keep working across the version skew between the two sides. Drop the
+    alias once the Mac app has shipped a build that reads `touchup_ms`.
+    """
+    return {
+        "asr_finalize_ms": asr_finalize_ms,
+        "touchup_ms": touchup_ms,
+        "gemma_ms": touchup_ms,  # deprecated alias
+    }
 
 
 async def _handle_session(websocket: WebSocketServerProtocol) -> None:
@@ -161,9 +177,9 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
         return
 
     # Hotkey released (or connection ended cleanly): finalize ASR, run the
-    # single Gemma polish call, send the result back. We time each stage
+    # deterministic touch-up, send the result back. We time each stage
     # (monotonic perf_counter) so the Mac can attribute post-release latency
-    # to ASR vs. Gemma — see master-plan §4 / mac-app/src/lib/timing.js.
+    # to ASR vs. touch-up — see macos-app/src/lib/timing.js.
     forward_task.cancel()
     _t_finalize_start = time.perf_counter()
     raw_text = session.finalize()
@@ -181,22 +197,22 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
                     "type": "polished",
                     "raw_text": "",
                     "polished_text": "",
-                    "timings": {"asr_finalize_ms": asr_finalize_ms, "gemma_ms": None},
+                    "timings": _timings(asr_finalize_ms, None),
                 }
             )
         )
         logger.info("Dictation session ended with no speech detected")
         return
 
-    gemma_ms = None
+    touchup_ms = None
     try:
         _t_polish_start = time.perf_counter()
         polished_text = polish(raw_text, personalize=True, known_terms=known_terms)
-        gemma_ms = round((time.perf_counter() - _t_polish_start) * 1000)
+        touchup_ms = round((time.perf_counter() - _t_polish_start) * 1000)
     except Exception:
-        logger.exception("Unhandled error during polish step")
+        logger.exception("Unhandled error during touch-up step")
         await websocket.send(
-            json.dumps({"type": "error", "message": "polish step failed, raw transcript follows"})
+            json.dumps({"type": "error", "message": "touch-up step failed, raw transcript follows"})
         )
         polished_text = raw_text
 
@@ -206,35 +222,34 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
                 "type": "polished",
                 "raw_text": raw_text,
                 "polished_text": polished_text,
-                "timings": {"asr_finalize_ms": asr_finalize_ms, "gemma_ms": gemma_ms},
+                "timings": _timings(asr_finalize_ms, touchup_ms),
             }
         )
     )
     logger.info(
-        "Dictation session complete (asr_finalize=%sms, gemma=%sms)", asr_finalize_ms, gemma_ms
+        "Dictation session complete (asr_finalize=%sms, touchup=%sms)", asr_finalize_ms, touchup_ms
     )
 
 
 def _warm_models() -> None:
     """
-    Load Moonshine and preload Gemma at startup so the FIRST dictation isn't
-    slow (the cold-start rough edge documented in README.md). Best-effort: if
-    Ollama isn't up yet or Moonshine's download hasn't finished, log and carry
-    on — the existing lazy paths (get_transcriber / ensure_model_ready) will
-    retry on first use. Crucially this does NOT load/unload in a cycle, so it
-    doesn't risk the CMA fragmentation called out in CLAUDE.md Decision 9 —
-    each model loads exactly once and stays resident.
+    Load Moonshine at startup so the FIRST dictation isn't slow. Best-effort:
+    if the model download hasn't finished, log and carry on — get_transcriber()
+    will retry lazily on first use.
+
+    There is only one model to warm now; the Gemma/Ollama preload that used to
+    live here went away with the LLM polish step. The load happens exactly once
+    and the model stays resident for the process lifetime, which also avoids the
+    CMA fragmentation that repeated load/unload cycles cause on this hardware.
+
+    Note this loads weights but does not run a dummy inference, so a first-call
+    graph-build cost (if any) is still paid on dictation #1.
     """
     try:
         logger.info("Warming Moonshine model at startup...")
         get_transcriber()
     except Exception:
         logger.exception("Moonshine warm-up failed; will load lazily on first dictation")
-    try:
-        logger.info("Warming Gemma (Ollama) at startup...")
-        ensure_model_ready()
-    except Exception:
-        logger.exception("Gemma warm-up failed; will load lazily on first dictation")
 
 
 async def main() -> None:

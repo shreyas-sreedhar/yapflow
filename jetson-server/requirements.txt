@@ -1,17 +1,22 @@
 # Yapflow Jetson server dependencies
 #
-# Install with: pip install -r requirements.txt --break-system-packages
-# (Jetson's system Python needs --break-system-packages for most pip
-# installs — see docs/yapflow-master-plan.md Section 5 for Jetson-
-# specific environment notes.)
+# Install into a venv, not system Python: see deploy/install.sh, which creates
+# /opt/yapflow/venv and installs this file into it.
+#
+# Do NOT use `pip install --break-system-packages` (which earlier versions of
+# this file recommended). JetPack 6.x is Ubuntu 22.04, whose system Python is
+# PEP 668 externally-managed, and installing into it fights JetPack's own
+# NVIDIA-shipped Python packages.
 
-websockets>=12.0
-ollama>=0.3.0
-moonshine-voice>=0.0.49
-numpy>=1.24
+# Upper bounds are deliberate, not cargo-culting. websockets 14 removed
+# `websockets.server.WebSocketServerProtocol` and the legacy `serve()` handler
+# signature, both of which server.py uses — an unpinned install breaks on a
+# fresh machine.
+websockets>=12.0,<15
 
-# Only needed if you set EXPECT_RAW_PCM = False in server.py to decode Opus
-# server-side instead of on the Mac client. Left commented out by default
-# since the recommended default keeps Opus decoding on the Mac side (see
-# server.py module docstring).
-# opuslib>=3.0.1
+# 0.1.1 is the first release publishing manylinux_2_34_aarch64 wheels, which is
+# what resolves on JetPack 6.x (glibc 2.35). Below that there's no aarch64 wheel
+# and pip falls through to a source build that won't succeed here.
+moonshine-voice>=0.1.1,<0.2
+
+numpy>=1.24,<3

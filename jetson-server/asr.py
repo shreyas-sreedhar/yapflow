@@ -68,9 +68,22 @@ def get_transcriber() -> Transcriber:
     """
     global _transcriber
     if _transcriber is None:
-        model_path, model_arch = get_model_for_language(
-            "en", getattr(ModelArch, config.MOONSHINE_MODEL_ARCH, None)
-        )
+        # Fail loudly on a bad YAPFLOW_ASR_MODEL. This used to be
+        # getattr(..., None), which silently handed None to
+        # get_model_for_language() and quietly loaded the library default — so a
+        # typo'd env var looked like it worked while running a different model
+        # than the one you asked for, and every latency measurement taken
+        # afterwards was against the wrong thing.
+        try:
+            requested_arch = getattr(ModelArch, config.MOONSHINE_MODEL_ARCH)
+        except AttributeError:
+            valid = [name for name in dir(ModelArch) if not name.startswith("_")]
+            raise ValueError(
+                f"YAPFLOW_ASR_MODEL={config.MOONSHINE_MODEL_ARCH!r} is not a valid "
+                f"ModelArch. Valid values: {', '.join(sorted(valid))}"
+            ) from None
+
+        model_path, model_arch = get_model_for_language("en", requested_arch)
         logger.info(
             "Loading Moonshine model (%s) — first load only, stays resident",
             config.MOONSHINE_MODEL_ARCH,
