@@ -1,0 +1,69 @@
+[Unit]
+Description=Yapflow dictation ASR server
+Documentation=https://github.com/shreyas-sreedhar/yapflow
+
+# The server binds a socket and, on first run only, may download the Moonshine
+# model. network-online (not just network.target) is what actually guarantees a
+# routable address is up — network.target only means the networking stack has
+# started, which is why services that bind early sometimes fail on a cold boot.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Run as an unprivileged user. install.sh creates this account with no login
+# shell; nothing here needs root, and the process listens on the LAN.
+User=yapflow
+Group=yapflow
+
+WorkingDirectory=/opt/yapflow/app
+ExecStart=/opt/yapflow/venv/bin/python -u /opt/yapflow/app/server.py
+
+# -u above matters: without unbuffered output, log lines sit in Python's stdio
+# buffer and journalctl shows nothing until the buffer fills, which makes the
+# service look hung when it's working fine.
+
+Restart=always
+RestartSec=2
+
+# Model cache location. Pre-populated by install.sh so a boot with no network
+# still works — get_model_for_language() would otherwise try to download on
+# first use.
+Environment=MOONSHINE_VOICE_CACHE=/var/lib/yapflow/models
+
+# Uncomment and set to match the Mac app's YAPFLOW_SECRET to require auth.
+# Prefer an EnvironmentFile over putting the secret here, since unit files are
+# world-readable.
+# EnvironmentFile=/etc/yapflow/yapflow.env
+
+# Model choice: SMALL_STREAMING or MEDIUM_STREAMING. MEDIUM is affordable now
+# that no LLM shares the memory. A typo here is a hard error, not a silent
+# fallback, so a failed start with a ValueError in the log means check this.
+# Environment=YAPFLOW_ASR_MODEL=MEDIUM_STREAMING
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yapflow
+
+# Give the model load room on a cold boot; the service isn't "started" until the
+# socket is listening, and loading weights from disk on an Orin Nano can take a
+# few seconds.
+TimeoutStartSec=180
+
+# SIGTERM is handled in server.py, so stop and restart are graceful and quick.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# --- Hardening ---
+# Deliberately mild. Tighter sandboxing (ProtectHome, PrivateDevices,
+# SystemCallFilter) tends to break the NVIDIA userspace stack on JetPack, and the
+# failures are obscure. If you tighten this, verify the model still loads.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ReadWritePaths=/var/lib/yapflow
+
+[Install]
+WantedBy=multi-user.target

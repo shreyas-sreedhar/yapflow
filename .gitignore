@@ -4,6 +4,17 @@ __pycache__/
 .DS_Store
 macos-app/.xcodeproj/xcuserdata/
 macos-app/Build/
+macos-app/node_modules/
+
+# The compiled Swift inject helper — built per-machine via `npm run build-helper`.
+macos-app/helpers/inject
+
 docs/
 CLAUDE.MD
+
+# Personal scratch notes. Note this pattern is case-sensitive on Linux but NOT on
+# a default macOS checkout (core.ignorecase=true), where it also swallows
+# README.md — hence the explicit negations below for docs that are meant to be
+# tracked. Without them, deploy docs silently vanish from commits made on a Mac.
 readme.*
+!jetson-server/deploy/README.md

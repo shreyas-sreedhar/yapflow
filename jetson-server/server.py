@@ -63,6 +63,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import signal
 import time
 
 import websockets
@@ -382,12 +383,40 @@ def _warm_models() -> None:
 
 async def main() -> None:
     logger.info("Starting Yapflow server on %s:%d", config.HOST, config.PORT)
-    # Warm-up is blocking model I/O; run it off the event loop so startup
-    # logging/serve setup isn't stalled, but await it before accepting
-    # connections so the first client doesn't race a half-loaded model.
-    await asyncio.get_event_loop().run_in_executor(None, _warm_models)
-    async with websockets.serve(_handle_session, config.HOST, config.PORT, max_size=2**22):
-        await asyncio.Future()  # run forever
+
+    # Warm-up is blocking model I/O; run it off the event loop so startup logging
+    # and serve setup aren't stalled, but await it before accepting connections so
+    # the first client doesn't race a half-loaded model.
+    await asyncio.get_running_loop().run_in_executor(None, _warm_models)
+
+    # Shut down cleanly on SIGTERM, which is what `systemctl stop` and
+    # `systemctl restart` send. Without this the process ran until systemd's
+    # timeout expired and then took SIGKILL, which meant every restart looked
+    # like a 90-second hang and in-flight dictations died mid-write.
+    loop = asyncio.get_running_loop()
+    shutdown = asyncio.Event()
+    for signal_name in ("SIGTERM", "SIGINT"):
+        try:
+            loop.add_signal_handler(getattr(signal, signal_name), shutdown.set)
+        except (NotImplementedError, AttributeError):
+            # Not available on every platform; the default handler still applies.
+            pass
+
+    async with websockets.serve(
+        _handle_session,
+        config.HOST,
+        config.PORT,
+        max_size=2**22,
+        # Detect a Mac that vanished without closing (laptop lid, WiFi drop).
+        # Matters more now that connections are long-lived rather than one per
+        # dictation: without it, dead sockets would accumulate.
+        ping_interval=20,
+        ping_timeout=20,
+    ):
+        logger.info("Ready — listening for dictations")
+        await shutdown.wait()
+
+    logger.info("Shutting down")
 
 
 if __name__ == "__main__":
