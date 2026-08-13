@@ -124,16 +124,22 @@ func writeClipboard(_ text: String) -> Int {
 
 /// Posts a synthetic key combo with exactly the given flags — never the
 /// hardware's current modifiers. See makeEventSource().
-func postKeyCombo(virtualKey: CGKeyCode, flags: CGEventFlags) {
+///
+/// Returns false if the event could not be created or posted. Callers MUST
+/// propagate that: reporting success for a keystroke that never happened desyncs
+/// the JS side's idea of what is at the cursor, and every subsequent diff is then
+/// computed against text that isn't there.
+@discardableResult
+func postKeyCombo(virtualKey: CGKeyCode, flags: CGEventFlags) -> Bool {
     guard let source = makeEventSource() else {
         FileHandle.standardError.write("Failed to create CGEventSource\n".data(using: .utf8)!)
-        return
+        return false
     }
 
     guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: true),
           let keyUp = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: false) else {
         FileHandle.standardError.write("Failed to create CGEvent\n".data(using: .utf8)!)
-        return
+        return false
     }
 
     keyDown.flags = flags
@@ -144,24 +150,36 @@ func postKeyCombo(virtualKey: CGKeyCode, flags: CGEventFlags) {
     // into whatever app currently has focus.
     keyDown.post(tap: .cgAnnotatedSessionEventTap)
     keyUp.post(tap: .cgAnnotatedSessionEventTap)
+    return true
 }
 
-func paste() {
-    postKeyCombo(virtualKey: 0x09, flags: .maskCommand) // kVK_ANSI_V
+@discardableResult
+func paste() -> Bool {
+    return postKeyCombo(virtualKey: 0x09, flags: .maskCommand) // kVK_ANSI_V
 }
 
-func selectAll() {
-    postKeyCombo(virtualKey: 0x00, flags: .maskCommand) // kVK_ANSI_A
+@discardableResult
+func selectAll() -> Bool {
+    return postKeyCombo(virtualKey: 0x00, flags: .maskCommand) // kVK_ANSI_A
 }
 
 /// Sends `count` backspaces. Used to retract previously-typed live partial text
 /// without resorting to Cmd+A, which would select — and therefore destroy — text
 /// the user already had in the field.
-func backspace(count: Int) {
-    guard count > 0 else { return }
+///
+/// Returns false if ANY backspace failed, and stops at the first failure. A
+/// partially-completed retraction is the dangerous case: reporting success would
+/// leave the JS side believing more text was removed than actually was, so the
+/// next diff over-retracts into the user's own text.
+@discardableResult
+func backspace(count: Int) -> Bool {
+    guard count > 0 else { return true }
     for _ in 0..<count {
-        postKeyCombo(virtualKey: 0x33, flags: []) // kVK_Delete
+        if !postKeyCombo(virtualKey: 0x33, flags: []) { // kVK_Delete
+            return false
+        }
     }
+    return true
 }
 
 /// Types literal text via synthetic Unicode keystrokes.
@@ -173,18 +191,20 @@ func backspace(count: Int) {
 /// takes UTF-16, so a scalar outside the BMP (emoji, for instance) has to be
 /// delivered as its full surrogate pair. Truncating each scalar to a single
 /// UniChar — as this function used to — silently mangled anything above U+FFFF.
-func typeText(_ text: String) {
+@discardableResult
+func typeText(_ text: String) -> Bool {
     guard let source = makeEventSource() else {
         FileHandle.standardError.write("Failed to create CGEventSource\n".data(using: .utf8)!)
-        return
+        return false
     }
 
     var utf16 = Array(text.utf16)
-    guard !utf16.isEmpty else { return }
+    guard !utf16.isEmpty else { return true }
 
     guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
           let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
-        return
+        FileHandle.standardError.write("Failed to create CGEvent for typeText\n".data(using: .utf8)!)
+        return false
     }
     keyDown.flags = []
     keyUp.flags = []
@@ -197,6 +217,7 @@ func typeText(_ text: String) {
     keyUp.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
     keyDown.post(tap: .cgAnnotatedSessionEventTap)
     keyUp.post(tap: .cgAnnotatedSessionEventTap)
+    return true
 }
 
 /// Returns the bundle identifier of the app that currently has focus — the app
@@ -209,32 +230,50 @@ func frontmostAppBundleId() -> String {
 
 // MARK: - Paste-with-restore
 //
-// Writes text, posts Cmd+V, waits for the target app to actually read the
-// pasteboard, then puts the user's clipboard back.
+// Writes text, posts Cmd+V, gives the target app time to read the pasteboard,
+// then puts the user's clipboard back.
 //
-// The wait used to be a flat 250ms sleep on the JS side, which was both too slow
-// in the common case and not actually a guarantee in the slow case. Instead poll
-// `changeCount`: when it moves past our own write, something else has taken the
-// pasteboard and restoring is safe. Cap the wait so a target app that never
-// touches the pasteboard can't strand the user's clipboard.
+// A NOTE ON WHY THIS IS STILL A SLEEP.
+//
+// An earlier version polled `NSPasteboard.general.changeCount`, on the theory
+// that it would move once the target app had taken the pasteboard, letting the
+// restore happen as soon as it was safe. That does not work: changeCount
+// increments on WRITES (clearContents/declareTypes), and an app servicing Cmd+V
+// only READS. The count therefore never moved, the loop always ran to its
+// timeout, and the "fast path" was a fixed 250ms sleep wearing a costume.
+//
+// There is no public API that reports "the frontmost app has finished reading the
+// pasteboard", so a delay is the only option. What we can do is keep it off the
+// critical path: post Cmd+V, return to the caller immediately, and do the wait
+// and restore on a background queue. The user gets their text at Cmd+V time; the
+// clipboard heals a moment later.
+//
+// The tradeoff that remains: an app slower than restoreDelay to service the paste
+// gets the restored (old) clipboard instead of the dictated text. 250ms is very
+// generous for a local paste, and losing a paste is recoverable — the text is
+// still in the transcript — whereas making every dictation wait is not.
 
-let restorePollInterval: TimeInterval = 0.005
-let restorePollTimeout: TimeInterval = 0.25
+let restoreDelay: TimeInterval = 0.25
+private let restoreQueue = DispatchQueue(label: "ai.yapflow.inject.restore")
+// Tracks deferred restores that haven't run yet, so shutdown can wait for them.
+private let pendingRestores = DispatchGroup()
 
-func pasteTextPreservingClipboard(_ text: String) {
+@discardableResult
+func pasteTextPreservingClipboard(_ text: String) -> Bool {
     let snapshot = snapshotPasteboard()
-    let ourChangeCount = writeClipboard(text)
-    paste()
+    writeClipboard(text)
+    let posted = paste()
 
-    let deadline = Date().addingTimeInterval(restorePollTimeout)
-    while Date() < deadline {
-        if NSPasteboard.general.changeCount != ourChangeCount {
-            break
-        }
-        Thread.sleep(forTimeInterval: restorePollInterval)
+    // Off the critical path. Serialized on one queue so overlapping pastes restore
+    // in order rather than racing each other, and tracked in a group so shutdown
+    // can wait rather than abandoning the user's clipboard.
+    pendingRestores.enter()
+    restoreQueue.asyncAfter(deadline: .now() + restoreDelay) {
+        restorePasteboard(snapshot)
+        pendingRestores.leave()
     }
 
-    restorePasteboard(snapshot)
+    return posted
 }
 
 // MARK: - Daemon
@@ -284,21 +323,31 @@ func handleDaemonLine(_ line: String) {
     case "ping":
         respond(id: id, ok: true)
 
+    // Every event-synthesis command reports whether it actually happened. The JS
+    // side tracks what it believes is at the cursor and diffs against it, so a
+    // false success is worse than an error: it silently desyncs that model and
+    // every later retraction is computed from the wrong length.
     case "paste":
         guard let text = text else {
             respond(id: id, ok: false, error: "paste requires text")
             return
         }
-        pasteTextPreservingClipboard(text)
-        respond(id: id, ok: true)
+        if pasteTextPreservingClipboard(text) {
+            respond(id: id, ok: true)
+        } else {
+            respond(id: id, ok: false, error: "failed to post Cmd+V (Accessibility permission?)")
+        }
 
     case "type":
         guard let text = text else {
             respond(id: id, ok: false, error: "type requires text")
             return
         }
-        typeText(text)
-        respond(id: id, ok: true)
+        if typeText(text) {
+            respond(id: id, ok: true)
+        } else {
+            respond(id: id, ok: false, error: "failed to synthesize keystrokes (Accessibility permission?)")
+        }
 
     case "backspace":
         // JSONSerialization hands back NSNumber for JSON numbers.
@@ -306,12 +355,18 @@ func handleDaemonLine(_ line: String) {
             respond(id: id, ok: false, error: "backspace requires an integer count")
             return
         }
-        backspace(count: count)
-        respond(id: id, ok: true)
+        if backspace(count: count) {
+            respond(id: id, ok: true)
+        } else {
+            respond(id: id, ok: false, error: "backspace incomplete (Accessibility permission?)")
+        }
 
     case "select-all":
-        selectAll()
-        respond(id: id, ok: true)
+        if selectAll() {
+            respond(id: id, ok: true)
+        } else {
+            respond(id: id, ok: false, error: "failed to post Cmd+A (Accessibility permission?)")
+        }
 
     case "read-clipboard":
         respond(id: id, ok: true, value: readClipboard())
@@ -340,6 +395,16 @@ func runDaemon() {
         if line.isEmpty { continue }
         handleDaemonLine(line)
     }
+
+    // Clipboard restores are deferred, so a paste right before shutdown may still
+    // have one pending. Exiting now would leave the dictated text on the user's
+    // clipboard in place of whatever they had copied.
+    //
+    // A DispatchGroup, not restoreQueue.sync: the restores are scheduled with
+    // asyncAfter, and a sync block submitted now would run BEFORE a delayed block
+    // whose deadline hasn't arrived — waiting on the queue would prove nothing.
+    // The timeout is a little over the delay so a wedged restore can't hang exit.
+    _ = pendingRestores.wait(timeout: .now() + restoreDelay + 0.5)
 }
 
 // MARK: - Entry point

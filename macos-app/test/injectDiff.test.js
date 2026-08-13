@@ -42,13 +42,22 @@ function graphemeCount(text) {
 
 function commonPrefixLength(a, b) {
   const max = Math.min(a.length, b.length);
-  let i = 0;
-  while (i < max && a[i] === b[i]) i++;
-  if (i > 0 && i < a.length) {
-    const code = a.charCodeAt(i - 1);
-    if (code >= 0xd800 && code <= 0xdbff) i--;
+  let raw = 0;
+  while (raw < max && a[raw] === b[raw]) raw++;
+  if (raw === 0 || raw === a.length) return raw;
+
+  if (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function') {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    let aligned = 0;
+    for (const { index } of segmenter.segment(a)) {
+      if (index > raw) break;
+      aligned = index;
+    }
+    return aligned;
   }
-  return i;
+
+  const code = a.charCodeAt(raw - 1);
+  return code >= 0xd800 && code <= 0xdbff ? raw - 1 : raw;
 }
 
 /**
@@ -159,6 +168,26 @@ const tests = {
     const p = plan('line one', 'line one\n\nline two');
     assert.strictEqual(p.retract, 0);
     assert.strictEqual(p.tail, '\n\nline two');
+  },
+
+  'prefix never splits a multi-code-point grapheme cluster'() {
+    // The bug: these share code units but not whole clusters. Splitting one gave a
+    // retraction count larger than the number of graphemes actually in the field,
+    // so the extra backspaces ate the user's own text.
+    const cases = [
+      ['\u{1F468}\u200D\u{1F469}\u200D\u{1F467}', '\u{1F468}'],   // ZWJ family vs lone man
+      ['\u{1F44B}\u{1F3FD}', '\u{1F44B}'],                          // wave + skin tone vs wave
+      ['hi \u{1F1FA}\u{1F1F8}', 'hi \u{1F1FA}'],                    // flag vs regional indicator
+      ['cafe\u0301', 'cafe'],                                          // decomposed accent
+    ];
+    for (const [injected, target] of cases) {
+      const p = plan(injected, target);
+      assert.ok(
+        p.retract <= graphemeCount(injected),
+        `retract ${p.retract} > ${graphemeCount(injected)} graphemes for ${JSON.stringify(injected)}`
+      );
+      assert.strictEqual(p.result, target, JSON.stringify([injected, target]));
+    }
   },
 
   'plan is always reversible: result equals target'() {

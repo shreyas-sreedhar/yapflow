@@ -149,20 +149,39 @@ function graphemeCount(text) {
 }
 
 /**
- * Length of the longest common prefix of two strings, measured in whole
- * grapheme clusters so the split point never lands inside one.
+ * Length of the longest common prefix of two strings, in UTF-16 code units, but
+ * truncated so the split never lands inside a grapheme cluster.
+ *
+ * Aligning to whole clusters is required for the retraction arithmetic to be
+ * safe. Backing off only surrogate pairs — which is what this used to do — is not
+ * enough: a cluster can be several code points, and splitting one produces a
+ * prefix whose grapheme count no longer corresponds to the number of backspaces
+ * the field will actually honour. Concretely, injected "👨‍👩‍👧" against target
+ * "👨" shares two code units, which looked like a one-cluster prefix plus a
+ * one-cluster retraction — two backspaces for a field holding ONE grapheme, so the
+ * second ate a character of the user's own text. That's exactly the failure
+ * removing Cmd+A was meant to eliminate.
  */
 function commonPrefixLength(a, b) {
   const max = Math.min(a.length, b.length);
-  let i = 0;
-  while (i < max && a[i] === b[i]) i++;
-  // Back off if we've split a surrogate pair, which would produce a lone
-  // surrogate on either side of the cut.
-  if (i > 0 && i < a.length) {
-    const code = a.charCodeAt(i - 1);
-    if (code >= 0xd800 && code <= 0xdbff) i--;
+  let raw = 0;
+  while (raw < max && a[raw] === b[raw]) raw++;
+  if (raw === 0 || raw === a.length) return raw;
+
+  // Walk `a`'s cluster boundaries and take the last one at or before `raw`.
+  if (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function') {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    let aligned = 0;
+    for (const { index } of segmenter.segment(a)) {
+      if (index > raw) break;
+      aligned = index;
+    }
+    return aligned;
   }
-  return i;
+
+  // Fallback: at least keep surrogate pairs intact.
+  const code = a.charCodeAt(raw - 1);
+  return code >= 0xd800 && code <= 0xdbff ? raw - 1 : raw;
 }
 
 /**
@@ -197,6 +216,17 @@ function queueInjection(generation, work) {
     })
     .catch((err) => {
       console.error('Injection step failed:', err.message);
+      // We no longer know what is at the cursor. A request can fail AFTER the
+      // helper performed the work — a timeout, or the helper dying between
+      // posting Cmd+V and replying — so injectedText may over- or under-state
+      // reality.
+      //
+      // Resolve that asymmetrically: clear it, so no further backspaces are
+      // issued against a length we can't trust. The cost is that the next update
+      // may duplicate text, which is visible and the user can delete. The
+      // alternative is retracting past our own output into text they wrote, which
+      // is silent data loss. Duplication wins.
+      injectedText = '';
     });
   return injectionChain;
 }

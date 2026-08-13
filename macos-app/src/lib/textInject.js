@@ -101,6 +101,13 @@ function startDaemon() {
     console.error('inject daemon stderr:', data.trim());
   });
 
+  // Without a listener, an EPIPE on the pipe (helper died between our writable
+  // check and the write) is an unhandled stream error, which is fatal in the
+  // Electron main process. The 'exit' handler does the actual recovery.
+  child.stdin.on('error', (err) => {
+    console.error('inject daemon stdin error:', err.message);
+  });
+
   child.on('error', (err) => {
     console.error('inject daemon failed to start:', err.message);
     child = null;
