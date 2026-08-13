@@ -86,12 +86,14 @@ def get_transcriber() -> Transcriber:
         # than the one you asked for, and every latency measurement taken
         # afterwards was against the wrong thing.
         try:
-            requested_arch = getattr(ModelArch, config.MOONSHINE_MODEL_ARCH)
-        except AttributeError:
-            valid = [name for name in dir(ModelArch) if not name.startswith("_")]
+            # ModelArch[...] rather than getattr, and __members__ rather than
+            # dir(): ModelArch is an IntEnum, so dir() also lists every inherited
+            # int method and makes the error message useless.
+            requested_arch = ModelArch[config.MOONSHINE_MODEL_ARCH]
+        except KeyError:
             raise ValueError(
                 f"YAPFLOW_ASR_MODEL={config.MOONSHINE_MODEL_ARCH!r} is not a valid "
-                f"ModelArch. Valid values: {', '.join(sorted(valid))}"
+                f"ModelArch. Valid values: {', '.join(ModelArch.__members__)}"
             ) from None
 
         model_path, model_arch = get_model_for_language("en", requested_arch)

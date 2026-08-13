@@ -103,9 +103,42 @@ log "Installing Python dependencies"
 # dictation after any fresh install is slow. Do it now, at install time, when the
 # network is known to be up.
 
-log "Pre-downloading the Moonshine English model into $MODEL_CACHE"
+# Two flags here are load-bearing and easy to get wrong:
+#
+#   --stt         Without a mode flag the module prints usage and exits 1, which
+#                 under `set -e` aborts the install after the venv exists but
+#                 before systemd is configured. The upstream README's
+#                 `--language en` example predates this requirement.
+#
+#   --model-arch  Without it, get_model_for_language() resolves to
+#                 available_models[0], NOT the arch the server will ask for. The
+#                 wrong weights get cached, and the server then downloads the
+#                 right ones at first use — silently defeating the whole point of
+#                 pre-downloading.
+#
+# The arch number must match config.MOONSHINE_MODEL_ARCH. Read it from the
+# library's own enum rather than hardcoding, so this can't drift if upstream
+# renumbers: ModelArch is the single source of truth on both sides.
+
+ASR_MODEL="${YAPFLOW_ASR_MODEL:-SMALL_STREAMING}"
+log "Pre-downloading the Moonshine English model ($ASR_MODEL) into $MODEL_CACHE"
 mkdir -p "$MODEL_CACHE"
-MOONSHINE_VOICE_CACHE="$MODEL_CACHE" "$VENV_DIR/bin/python" -m moonshine_voice.download --language en
+
+MODEL_ARCH="$("$VENV_DIR/bin/python" -c "
+import sys
+from moonshine_voice import ModelArch
+try:
+    print(int(ModelArch['$ASR_MODEL']))
+except KeyError:
+    # __members__, not dir(): ModelArch is an IntEnum, so dir() also lists every
+    # inherited int method (bit_count, as_integer_ratio, …).
+    print(f\"'$ASR_MODEL' is not a valid ModelArch. Valid: {', '.join(ModelArch.__members__)}\", file=sys.stderr)
+    sys.exit(1)
+")" || die "invalid YAPFLOW_ASR_MODEL"
+
+log "Resolved $ASR_MODEL to model-arch $MODEL_ARCH"
+MOONSHINE_VOICE_CACHE="$MODEL_CACHE" "$VENV_DIR/bin/python" -m moonshine_voice.download \
+  --language en --stt --model-arch "$MODEL_ARCH"
 
 # The download runs as root; the service runs as $SERVICE_USER and must be able
 # to read it.
@@ -122,20 +155,61 @@ systemctl restart "$SERVICE_NAME"
 
 # --- Verify -------------------------------------------------------------------
 
-log "Waiting for the service to come up"
-for _ in $(seq 1 60); do
-  if systemctl is-active --quiet "$SERVICE_NAME"; then break; fi
+PORT="${YAPFLOW_PORT:-8765}"
+
+# `systemctl is-active` is useless as a readiness check here: the unit is
+# Type=simple, so systemd reports active the instant it forks, long before the
+# model is loaded and the socket is bound. A server that dies three seconds into
+# loading weights would have reported "Done", and Restart=always would then hide
+# the crash loop behind a service that looks up.
+#
+# So probe the actual protocol: connect, handshake, ping, expect pong. That's the
+# only check that proves the thing works.
+log "Waiting for the server to accept connections on port $PORT"
+
+READY=0
+for _ in $(seq 1 90); do
+  if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+    printf '\n'
+    systemctl status "$SERVICE_NAME" --no-pager || true
+    journalctl -u "$SERVICE_NAME" -n 40 --no-pager || true
+    die "service exited during startup — see the log above"
+  fi
+
+  if MOONSHINE_VOICE_CACHE="$MODEL_CACHE" "$VENV_DIR/bin/python" - "$PORT" <<'PROBE' 2>/dev/null
+import asyncio, json, sys
+import websockets
+
+async def probe(port):
+    async with websockets.connect(f"ws://127.0.0.1:{port}", open_timeout=3) as ws:
+        await ws.send(json.dumps({"type": "hello"}))
+        await ws.send(json.dumps({"type": "ping"}))
+        reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
+        return reply.get("type") == "pong"
+
+try:
+    sys.exit(0 if asyncio.run(probe(int(sys.argv[1]))) else 1)
+except Exception:
+    sys.exit(1)
+PROBE
+  then
+    READY=1
+    break
+  fi
   sleep 1
 done
 
-if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+if [[ "$READY" -ne 1 ]]; then
   printf '\n'
   systemctl status "$SERVICE_NAME" --no-pager || true
   journalctl -u "$SERVICE_NAME" -n 40 --no-pager || true
-  die "service failed to start — see the log above"
+  die "server never answered a ping — see the log above.
+     If a shared secret is configured via EnvironmentFile, this probe cannot
+     authenticate and will always fail; that case is expected, check the log
+     for 'Ready — listening for dictations' instead."
 fi
 
-PORT="$(grep -oP 'YAPFLOW_PORT.*?"\K[0-9]+' "$APP_DIR/config.py" 2>/dev/null || echo 8765)"
+log "Server answered a ping — it's up and serving"
 
 cat <<EOF
 

@@ -31,6 +31,8 @@ import logging
 import re
 from typing import Optional
 
+import config
+
 logger = logging.getLogger("yapflow.polish")
 
 # Bounds on the personal dictionary. The terms arrive from the Mac client over
@@ -54,8 +56,11 @@ MAX_TERM_LENGTH = 64
 #   "sort of"  -> "sort of thing"
 #   "ah"       -> "ah ha", and it's a real interjection
 #   "you know" -> "do you know him", "did you know", "you know how to"
+# The (?![-\w]) tail is why this uses a lookahead rather than a trailing \b:
+# \b sits happily before a hyphen, so \buh\b matched inside "uh-huh" and left
+# "-huh" behind. "uh-huh" is a real word meaning yes.
 _FILLER_PATTERN = re.compile(
-    r"\b(?:umm?|uhh?|erm|hmm+|mhm)\b[\s,]*",
+    r"\b(?:umm?|uhh?|erm|hmm+|mhm)(?![-\w])[\s,]*",
     re.IGNORECASE,
 )
 
@@ -86,24 +91,64 @@ _FENCED_FILLERS = [
 # line. Bounded on both sides so "i.e." and identifiers like "i18n" survive.
 _LONE_I = re.compile(r"\bi\b(?![.\w])")
 
-# Spoken punctuation and formatting commands. Ordered longest-first within the
-# alternation so "new paragraph" wins over "new line" and can't be partially
-# consumed. The leading \s* lets these absorb the space before them, so
-# "hello period" becomes "hello." and not "hello ."
+# Spoken punctuation and formatting commands. OFF BY DEFAULT — see
+# config.SPOKEN_COMMANDS_ENABLED and the long explanation below.
+#
+# These are ordered longest-first so "new paragraph" wins over "new line" and
+# "exclamation mark" isn't partially consumed. The leading \s* absorbs the space
+# before the command, so "hello period" becomes "hello." not "hello ."
+#
+# WHY OFF BY DEFAULT. Every word here is also an ordinary English word, and
+# nothing in a rules engine can tell which one the speaker meant. Applied
+# unconditionally they produce:
+#
+#   "a period of time"                -> "A. Of time"
+#   "the semicolon operator in C"     -> "The; operator in C"
+#   "comma separated values"          -> ", separated values"
+#   "in the new line of business"     -> "In the\nOf business"
+#   "we discussed the colon cancer"   -> "We discussed the: cancer"
+#
+# That is exactly the failure mode the filler list above is written to avoid, and
+# it was inconsistent to guard one and not the other. Distinguishing the command
+# from the word needs either an escape word or a language model — the same
+# unsolvable-by-rules problem as collapsing self-corrections.
+#
+# Moonshine v2 already emits punctuation, so the default costs almost nothing.
+# The determiner guard below makes the opt-in path survive the common cases, but
+# it is a heuristic and "comma separated values" still breaks. Enable knowing
+# that.
+# The leading whitespace class is [ \t]*, NOT \s*. With \s* these patterns eat a
+# preceding newline, so "first line new line comma then" lost its line break: the
+# comma rule consumed the \n that the new-line rule had just inserted.
 _SPOKEN_COMMANDS = [
-    (re.compile(r"\s*\bnew\s+paragraph\b", re.IGNORECASE), "\n\n"),
-    (re.compile(r"\s*\bnew\s+line\b", re.IGNORECASE), "\n"),
-    (re.compile(r"\s*\bquestion\s+mark\b", re.IGNORECASE), "?"),
-    (re.compile(r"\s*\bexclamation\s+(?:mark|point)\b", re.IGNORECASE), "!"),
-    (re.compile(r"\s*\bfull\s+stop\b", re.IGNORECASE), "."),
-    (re.compile(r"\s*\bperiod\b", re.IGNORECASE), "."),
-    (re.compile(r"\s*\bcomma\b", re.IGNORECASE), ","),
-    (re.compile(r"\s*\bcolon\b", re.IGNORECASE), ":"),
-    (re.compile(r"\s*\bsemicolon\b", re.IGNORECASE), ";"),
+    (re.compile(r"[ \t]*\bnew\s+paragraph\b", re.IGNORECASE), "\n\n"),
+    (re.compile(r"[ \t]*\bnew\s+line\b", re.IGNORECASE), "\n"),
+    (re.compile(r"[ \t]*\bquestion\s+mark\b", re.IGNORECASE), "?"),
+    (re.compile(r"[ \t]*\bexclamation\s+(?:mark|point)\b", re.IGNORECASE), "!"),
+    (re.compile(r"[ \t]*\bfull\s+stop\b", re.IGNORECASE), "."),
+    (re.compile(r"[ \t]*\bperiod\b", re.IGNORECASE), "."),
+    (re.compile(r"[ \t]*\bcomma\b", re.IGNORECASE), ","),
+    (re.compile(r"[ \t]*\bcolon\b", re.IGNORECASE), ":"),
+    (re.compile(r"[ \t]*\bsemicolon\b", re.IGNORECASE), ";"),
 ]
 
-# Whitespace before punctuation that should be closed up, e.g. "hello ." -> "hello."
-_SPACE_BEFORE_PUNCT = re.compile(r"\s+([.,!?;:])")
+# A command word preceded by one of these is being used as a noun, not a command:
+# "a period of time", "the new line of business", "this colon".
+#
+# Deliberately limited to true determiners and possessives. Quantifiers like
+# "one", "some", "every", "any" were in here initially and were too broad — they
+# blocked legitimate command uses ("say one, new line, two") without catching many
+# additional false positives, since noun uses overwhelmingly take an article or a
+# possessive.
+_DETERMINERS = frozenset(
+    """a an the this that these those my your his her its our their""".split()
+)
+
+# Whitespace before punctuation that should be closed up, e.g. "hello ." ->
+# "hello." Horizontal whitespace only: \s+ would also match the newlines that
+# "new line"/"new paragraph" just inserted, so "first line new line comma then"
+# collapsed to "First line, then" with the line break silently deleted.
+_SPACE_BEFORE_PUNCT = re.compile(r"[ \t]+([.,!?;:])")
 # Runs of horizontal whitespace (not newlines — those are meaningful here,
 # since "new paragraph" produces them).
 _HORIZONTAL_RUN = re.compile(r"[ \t]{2,}")
@@ -136,9 +181,37 @@ def _strip_fillers(text: str) -> str:
     return _FILLER_PATTERN.sub("", text)
 
 
+def _preceded_by_determiner(text: str, match_start: int) -> bool:
+    """
+    Whether the word immediately before `match_start` is a determiner or
+    possessive, which means the command word is being used as a noun.
+    """
+    preceding_words = text[:match_start].rstrip().rsplit(" ", 1)
+    if not preceding_words or not preceding_words[-1]:
+        return False
+    last = preceding_words[-1].strip().strip(".,!?;:").lower()
+    return last in _DETERMINERS
+
+
 def _apply_spoken_commands(text: str) -> str:
+    """
+    Replace spoken punctuation/formatting commands. No-op unless explicitly
+    enabled — see the note on _SPOKEN_COMMANDS for why.
+    """
+    if not config.SPOKEN_COMMANDS_ENABLED:
+        return text
+
     for pattern, replacement in _SPOKEN_COMMANDS:
-        text = pattern.sub(replacement, text)
+        # The guard needs the match position, so substitute via a callback and
+        # return the original text for a noun use. `text` is rebound each
+        # iteration, so the closure has to read the current value — hence the
+        # default-argument capture.
+        def _sub(match, current=text, repl=replacement):
+            if _preceded_by_determiner(current, match.start()):
+                return match.group(0)
+            return repl
+
+        text = pattern.sub(_sub, text)
     return text
 
 
@@ -235,10 +308,20 @@ def polish(
         text = raw_transcript
         text = _strip_fillers(text)
         text = _apply_spoken_commands(text)
-        if personalize:
-            text = _apply_known_terms(text, _sanitize_known_terms(known_terms))
         text = _normalize_whitespace(text)
         text = _recapitalize(text)
+
+        # Known terms go LAST, deliberately. They used to run before
+        # _recapitalize, which then uppercased the first letter of whatever it
+        # had just substituted — turning "iPhone" into "IPhone", "eBay" into
+        # "EBay", "npm" into "Npm". Those are exactly the terms the dictionary
+        # exists for, so the feature was breaking its own primary use case.
+        #
+        # Running last also gives the right precedence: an explicit entry the
+        # user taught the system beats generic sentence capitalization. A term
+        # like "npm" at the start of a sentence correctly stays lowercase.
+        if personalize:
+            text = _apply_known_terms(text, _sanitize_known_terms(known_terms))
 
         if not text.strip():
             # Everything we had was filler. Returning the raw transcript would

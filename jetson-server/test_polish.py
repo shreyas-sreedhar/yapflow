@@ -11,6 +11,9 @@ Run: python3 test_polish.py
 
 from __future__ import annotations
 
+import contextlib
+
+import config
 import polish
 
 
@@ -27,6 +30,17 @@ def check_contains_all(raw, words, known_terms=None):
     missing = [w for w in words if w.lower() not in lowered]
     if missing:
         raise AssertionError(f"{raw!r} -> {actual!r} lost {missing}")
+
+
+@contextlib.contextmanager
+def spoken_commands_enabled():
+    """Spoken commands are opt-in; flip the flag for the tests that cover them."""
+    original = config.SPOKEN_COMMANDS_ENABLED
+    config.SPOKEN_COMMANDS_ENABLED = True
+    try:
+        yield
+    finally:
+        config.SPOKEN_COMMANDS_ENABLED = original
 
 
 tests = {}
@@ -95,26 +109,58 @@ def test_filler_inside_a_word_is_not_removed():
 
 
 @test
-def test_spoken_punctuation():
-    check("hello period", "Hello.")
-    check("wait comma then go", "Wait, then go")
-    check("really question mark", "Really?")
-    check("stop exclamation mark", "Stop!")
-    check("done full stop", "Done.")
+def test_spoken_commands_are_off_by_default():
+    """
+    The default has to be off, because every command word is also an ordinary
+    English word and rules can't tell them apart. Enabled unconditionally, these
+    inputs were being mangled into the values in the comments.
+    """
+    check("a period of time", "A period of time")               # was "A. Of time"
+    check("the semicolon operator in C", "The semicolon operator in C")  # was "The; operator in C"
+    check("comma separated values are useful", "Comma separated values are useful")
+    check("we discussed the colon cancer study", "We discussed the colon cancer study")
+    check("in the new line of business", "In the new line of business")
+    check("that is a full stop for now", "That is a full stop for now")
+    check("the period of the pendulum", "The period of the pendulum")
 
 
 @test
-def test_new_line_and_paragraph():
-    check("one new line two", "One\nTwo")
-    check("one new paragraph two", "One\n\nTwo")
+def test_spoken_commands_work_when_enabled():
+    with spoken_commands_enabled():
+        check("hello period", "Hello.")
+        check("wait comma then go", "Wait, then go")
+        check("really question mark", "Really?")
+        check("stop exclamation mark", "Stop!")
+        check("done full stop", "Done.")
+        check("one new line two", "One\nTwo")
+        check("one new paragraph two", "One\n\nTwo")
+
+
+@test
+def test_determiner_guard_protects_noun_uses_when_enabled():
+    with spoken_commands_enabled():
+        check("a period of time", "A period of time")
+        check("the semicolon operator in C", "The semicolon operator in C")
+        check("in the new line of business", "In the new line of business")
+        check("my colon hurts", "My colon hurts")
+        check("that is a full stop for now", "That is a full stop for now")
+
+
+@test
+def test_command_does_not_eat_a_preceding_newline():
+    # The leading whitespace class must be [ \t]*, not \s*: with \s* the comma
+    # rule consumed the newline the new-line rule had just inserted, so
+    # "first line new line comma then" silently lost its line break.
+    with spoken_commands_enabled():
+        result = polish.polish("first line new line comma then")
+        assert "\n" in result, repr(result)
 
 
 @test
 def test_new_paragraph_wins_over_new_line():
-    # Ordered longest-first in the alternation so "new paragraph" can't be
-    # partially consumed as "new line"-adjacent.
-    result = polish.polish("a new paragraph b")
-    assert result == "A\n\nB", result
+    # Ordered longest-first so "new paragraph" can't be partially consumed.
+    with spoken_commands_enabled():
+        assert polish.polish("one new paragraph two") == "One\n\nTwo"
 
 
 # --- Personal dictionary ------------------------------------------------------
@@ -124,6 +170,30 @@ def test_new_paragraph_wins_over_new_line():
 def test_known_term_fixes_casing():
     check("deploy to kubernetes", "Deploy to Kubernetes", known_terms=["Kubernetes"])
     check("call yapflow now", "Call YapFlow now", known_terms=["YapFlow"])
+
+
+@test
+def test_known_term_casing_survives_recapitalization():
+    """
+    The dictionary exists for proper nouns, product names, and jargon — exactly
+    the terms whose casing generic sentence-capitalization destroys. Substitution
+    used to run BEFORE _recapitalize, which then uppercased what it had just
+    inserted: iPhone -> IPhone, eBay -> EBay, npm -> Npm.
+    """
+    check("iphone is great", "iPhone is great", known_terms=["iPhone"])
+    check("ebay and iphone", "eBay and iPhone", known_terms=["eBay", "iPhone"])
+    check("macos is fine. iphone too", "macOS is fine. iPhone too", known_terms=["macOS", "iPhone"])
+    # An explicit entry beats generic capitalization even at a sentence start.
+    check("npm install it", "npm install it", known_terms=["npm"])
+
+
+@test
+def test_hyphenated_interjections_are_not_amputated():
+    # \buh\b matches before a hyphen, so "uh-huh" became "-huh". "uh-huh" is a
+    # real word meaning yes; the residue was garbage.
+    check_contains_all("uh-huh and um-hum", ["uh-huh", "um-hum"])
+    # The bare fillers must still go.
+    check("um so yes uh", "So yes")
 
 
 @test
@@ -159,7 +229,11 @@ def test_known_terms_are_bounded():
 
 @test
 def test_non_string_known_terms_are_skipped():
-    result = polish.polish("hello", known_terms=[None, 42, {"a": 1}, "hello"])
+    # A term that does not appear in the text, so the assertion is about the
+    # non-string entries being skipped rather than about substitution. ("hello"
+    # as a term would legitimately force lowercase now, since known terms are
+    # applied after recapitalization and an explicit entry wins.)
+    result = polish.polish("hello", known_terms=[None, 42, {"a": 1}, "Kubernetes"])
     assert result == "Hello", result
 
 
@@ -214,8 +288,9 @@ def test_whitespace_is_normalized():
 
 @test
 def test_blank_lines_from_new_paragraph_survive_normalization():
-    result = polish.polish("one new paragraph two")
-    assert result == "One\n\nTwo", repr(result)
+    with spoken_commands_enabled():
+        result = polish.polish("one new paragraph two")
+        assert result == "One\n\nTwo", repr(result)
 
 
 # --- Robustness ---------------------------------------------------------------

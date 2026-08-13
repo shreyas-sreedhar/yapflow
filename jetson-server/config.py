@@ -36,5 +36,23 @@ MOONSHINE_MODEL_ARCH = os.environ.get("YAPFLOW_ASR_MODEL", "SMALL_STREAMING")
 # mostly affects how often live partial text refreshes, not final latency.
 ASR_UPDATE_INTERVAL_SECONDS = float(os.environ.get("YAPFLOW_ASR_UPDATE_INTERVAL", "0.3"))
 
+# --- Touch-up ---
+# Whether to interpret spoken punctuation and formatting commands ("period",
+# "comma", "new line", "question mark", …) in the transcript.
+#
+# OFF by default, and that default is deliberate. Every one of those words is
+# also an ordinary English word, and rules can't tell which the speaker meant:
+# enabled, "a period of time" becomes "A. Of time" and "the semicolon operator"
+# becomes "The; operator". Moonshine v2 already emits punctuation, so the cost of
+# leaving this off is small.
+#
+# Enabling adds a determiner guard that catches the common noun uses, but it's a
+# heuristic — "comma separated values" still breaks. See polish.py.
+SPOKEN_COMMANDS_ENABLED = os.environ.get("YAPFLOW_SPOKEN_COMMANDS", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # --- Logging ---
 LOG_LEVEL = os.environ.get("YAPFLOW_LOG_LEVEL", "INFO")
