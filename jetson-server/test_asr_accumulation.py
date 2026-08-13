@@ -33,6 +33,7 @@ Run with:  python3 -m pytest test_asr_accumulation.py -v
 from __future__ import annotations
 
 import asyncio
+import enum
 import sys
 import threading
 import types
@@ -58,11 +59,20 @@ def _stub_module(name: str, **attrs) -> None:
 
 
 _stub_module("numpy", int16=None, float32=None, frombuffer=None)
+# A real IntEnum, matching the library: asr.py uses ModelArch[name] and
+# ModelArch.__members__, neither of which a SimpleNamespace supports.
+class _FakeModelArch(enum.IntEnum):
+    TINY = 0
+    BASE = 1
+    TINY_STREAMING = 2
+    BASE_STREAMING = 3
+    SMALL_STREAMING = 4
+    MEDIUM_STREAMING = 5
+
+
 _stub_module(
     "moonshine_voice",
-    ModelArch=types.SimpleNamespace(
-        TINY_STREAMING=0, SMALL_STREAMING=1, MEDIUM_STREAMING=2
-    ),
+    ModelArch=_FakeModelArch,
     Transcriber=object,
     TranscriptEventListener=object,
     get_model_for_language=lambda *a, **k: (None, None),

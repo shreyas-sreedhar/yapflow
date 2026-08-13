@@ -252,7 +252,9 @@ async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) 
         async for message in websocket:
             if isinstance(message, (bytes, bytearray)):
                 # An audio frame: raw PCM16, 16kHz, mono. See module docstring.
-                session.feed_pcm_int16(message)
+                # Awaited because add_audio() runs the model inline rather than
+                # just enqueueing — see StreamingSession.feed_pcm_int16.
+                await session.feed_pcm_int16(message)
                 continue
 
             # A JSON control message.
@@ -277,12 +279,11 @@ async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) 
         # place rather than losing it — see macos-app/src/lib/wsClient.js.
         #
         # finalize() must still run even though its result is discarded: it's what
-        # calls _stream.stop(), and without it the Moonshine stream and its thread
-        # leak for the lifetime of the process. This path used to call close()
-        # alone, which only removes the listener.
+        # calls _stream.stop(), which ends the transcription session. close() then
+        # frees the native handle. Both are needed — see StreamingSession.close().
         forward_task.cancel()
         try:
-            session.finalize()
+            await session.finalize_async()
         except Exception:
             logger.exception("Error finalizing ASR session after connection drop")
         finally:
@@ -301,7 +302,7 @@ async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) 
     # updating near the end of every dictation.
     _t_finalize_start = time.perf_counter()
     try:
-        raw_text = session.finalize()
+        raw_text = await session.finalize_async()
     finally:
         session.close()
     asr_finalize_ms = round((time.perf_counter() - _t_finalize_start) * 1000)

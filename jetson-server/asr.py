@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
@@ -65,6 +66,20 @@ FINALIZE_TIMEOUT_SECONDS = 0.25
 # forwarding task can finish on its own instead of being cancelled out from under
 # a queue that still has partials in it.
 _RESULTS_DONE = object()
+
+# All Moonshine calls go through this ONE worker thread.
+#
+# max_workers=1 is the point, not a resource-saving default. The transcriber is a
+# process-global singleton and the native library is not thread-safe for
+# concurrent calls against it, so the work has to be serialized somewhere — doing
+# it here means correctness doesn't depend on callers happening to await in order.
+# It also keeps inference off the asyncio event loop, which is what lets the
+# server keep reading audio and sending partials while a pass is running.
+#
+# Module-level rather than per-session so serialization holds across back-to-back
+# dictations on a long-lived connection, and so there's no thread churn per
+# utterance.
+_inference_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="moonshine")
 
 
 def get_transcriber() -> Transcriber:
@@ -253,13 +268,10 @@ class StreamingSession:
         self._stream.start()
         self._finalized = False
 
-    def feed_pcm_int16(self, pcm_int16_bytes: bytes) -> None:
+    def _feed_pcm_int16_blocking(self, pcm_int16_bytes: bytes) -> None:
         """
-        Feed a chunk of decoded PCM audio into the stream. Opus decoders
-        (e.g. @discordjs/opus on the Mac side, or opuslib here if decoding
-        server-side) typically hand back signed 16-bit PCM. Moonshine wants
-        float32 in the range -1.0..1.0, so we convert here rather than
-        pushing that conversion onto the websocket handler.
+        The blocking half of feed_pcm_int16. Runs on a worker thread — see the
+        async wrapper below for why that matters.
         """
         # np.frombuffer raises on a buffer that isn't a whole number of int16s.
         # A truncated frame is a network artifact, not a reason to kill the
@@ -272,9 +284,41 @@ class StreamingSession:
         if not pcm_int16_bytes:
             return
 
+        # Moonshine wants float32 in -1.0..1.0; the wire carries int16.
         int16_array = np.frombuffer(pcm_int16_bytes, dtype=np.int16)
         float_array = (int16_array.astype(np.float32)) / 32768.0
         self._stream.add_audio(float_array, PCM_SAMPLE_RATE)
+
+    async def feed_pcm_int16(self, pcm_int16_bytes: bytes) -> None:
+        """
+        Feed a chunk of PCM16 audio into the stream.
+
+        This is async, and the actual work runs in an executor, because
+        `Stream.add_audio()` is NOT a cheap enqueue. It calls
+        `update_transcription()` inline whenever enough audio has accumulated,
+        which runs the model on the calling thread — the library's own docstring
+        puts a pass at roughly 102ms fixed plus 269ms per second of audio on the
+        tiny model. Called directly from the websocket handler, as it used to be,
+        that blocks the event loop for the whole pass: no audio frames read, no
+        partials sent, ping/pong stalled. The symptom is partial text arriving in
+        bursts and, on a loaded box, dropped connections.
+
+        Serialization is handled by the caller feeding frames one at a time in
+        order; the library is not thread-safe for concurrent calls on one stream,
+        so do not gather these.
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            _inference_executor, self._feed_pcm_int16_blocking, pcm_int16_bytes
+        )
+
+    async def finalize_async(self) -> str:
+        """
+        finalize() off the event loop. stop() runs a final transcription pass, so
+        it blocks for the same reasons add_audio does.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_inference_executor, self.finalize)
 
     async def results(self):
         """
@@ -347,7 +391,25 @@ class StreamingSession:
         return self._listener.transcript()
 
     def close(self) -> None:
+        """
+        Release the stream. Must be called exactly once per session.
+
+        `Stream.close()` is what calls the native `moonshine_free_stream`, and
+        `Stream` has no `__del__` — only `Transcriber` does. So removing the
+        listener (which is all this used to do) left the native handle and its
+        encoder/decoder cache allocated for the process lifetime: one leak per
+        dictation, on a box that now runs a single long-lived process serving
+        unbounded dictations in 8GB of unified memory.
+
+        Note `stop()` is not `close()`. stop() ends the transcription session;
+        close() frees the handle. Both are needed.
+        """
         try:
             self._stream.remove_listener(self._listener)
         except Exception:
             logger.exception("Error removing ASR listener during session close")
+
+        try:
+            self._stream.close()
+        except Exception:
+            logger.exception("Error closing ASR stream during session close")

@@ -14,6 +14,7 @@ Run: python3 test_protocol.py
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import sys
 import types
@@ -32,6 +33,9 @@ class _FakeStream:
         self._started = False
         self._completed_current = False
         self.stopped = False
+        # Mirrors the real library: close() is what frees the native handle, and
+        # Stream has no __del__, so a session that never calls it leaks.
+        self.closed = False
         # Words revealed one at a time as audio arrives, so partials grow.
         self._words = ["hello", "world", "this", "is", "a", "test"]
         self._revealed = 0
@@ -42,6 +46,10 @@ class _FakeStream:
     def remove_listener(self, listener):
         if listener in self._listeners:
             self._listeners.remove(listener)
+
+    def close(self):
+        self.closed = True
+        self._listeners.clear()
 
     def start(self):
         self._started = True
@@ -89,10 +97,20 @@ class _FakeTranscriber:
         return stream
 
 
+# A real IntEnum, not a SimpleNamespace: asr.py looks the arch up with
+# ModelArch[name] and reports valid values from ModelArch.__members__, so the stub
+# has to support both — same as the real library, whose ModelArch is an IntEnum.
+class _FakeModelArch(enum.IntEnum):
+    TINY = 0
+    BASE = 1
+    TINY_STREAMING = 2
+    BASE_STREAMING = 3
+    SMALL_STREAMING = 4
+    MEDIUM_STREAMING = 5
+
+
 _stub = types.ModuleType("moonshine_voice")
-_stub.ModelArch = types.SimpleNamespace(
-    TINY_STREAMING=0, SMALL_STREAMING=1, MEDIUM_STREAMING=2
-)
+_stub.ModelArch = _FakeModelArch
 _stub.Transcriber = _FakeTranscriber
 _stub.TranscriptEventListener = object
 _stub.get_model_for_language = lambda lang, arch=None: ("/fake/model/path", arch)
@@ -180,6 +198,29 @@ async def test_pause_mid_dictation_keeps_both_halves_end_to_end():
             raw = polished["raw_text"]
             assert "hello" in raw.lower(), f"first half lost: {raw!r}"
             assert "second" in raw.lower(), f"second half lost: {raw!r}"
+
+
+async def test_every_stream_is_freed_on_a_multi_utterance_connection():
+    """
+    Stream.close() is what calls moonshine_free_stream, and Stream has no
+    __del__ — so a session that only removes its listener leaks the native handle
+    plus its encoder/decoder cache for the process lifetime. That is once per
+    dictation on a box designed to serve unbounded dictations from one process.
+    """
+    async with websockets.serve(server._handle_session, HOST, PORT):
+        async with websockets.connect(URL) as ws:
+            await ws.send(json.dumps({"type": "hello"}))
+            for _ in range(3):
+                await ws.send(json.dumps({"type": "start_utterance"}))
+                for _ in range(12):
+                    await ws.send(pcm_frame())
+                await ws.send(json.dumps({"type": "end_of_utterance"}))
+                await read_until(ws, "polished")
+
+    streams = asr.get_transcriber().streams
+    assert len(streams) == 3, f"expected 3 streams, got {len(streams)}"
+    leaked = [i for i, s in enumerate(streams) if not s.closed]
+    assert not leaked, f"streams {leaked} were never closed"
 
 
 async def test_ping_pong_without_dictating():
@@ -361,7 +402,8 @@ async def test_client_disconnect_mid_dictation_stops_the_stream():
 
         transcriber = asr.get_transcriber()
         assert transcriber.streams, "no stream was ever created"
-        assert transcriber.streams[-1].stopped, "stream was leaked: stop() never called"
+        assert transcriber.streams[-1].stopped, "stop() never called"
+        assert transcriber.streams[-1].closed, "native handle leaked: close() never called"
 
 
 async def main():
