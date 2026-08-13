@@ -82,11 +82,11 @@ function render(m) {
   const stagePanel = `
     <div class="panel">
       <h2>Where the time goes (avg per stage)</h2>
-      <div class="hint">The bottleneck is usually ASR finalize or buffering, not Gemma — this is how you confirm it.</div>
+      <div class="hint">Touch-up should be under 1ms and paste in the low tens. Anything larger is a regression — historical rows from before the LLM was removed will show touch-up in the seconds.</div>
       ${barRows([
         { label: 'Audio → 1st partial', value: m.stageAverages.timeToFirstPartialMs },
         { label: 'ASR finalize', value: m.stageAverages.asrFinalizeMs },
-        { label: 'Gemma polish', value: m.stageAverages.gemmaMs },
+        { label: 'Touch-up', value: m.stageAverages.touchupMs },
         { label: 'Release → polished', value: m.stageAverages.releaseToPolishedMs },
         { label: 'Clipboard paste', value: m.stageAverages.pasteMs },
       ])}

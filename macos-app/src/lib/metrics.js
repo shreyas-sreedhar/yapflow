@@ -63,7 +63,12 @@ function getMetrics() {
       `SELECT AVG(time_to_first_partial_ms) AS first_partial,
               AVG(release_to_polished_ms)   AS release_to_polished,
               AVG(asr_finalize_ms)          AS asr_finalize,
-              AVG(gemma_ms)                 AS gemma,
+              -- The gemma_ms column now holds the deterministic touch-up's
+              -- duration. The column name is kept because renaming it needs a
+              -- migration and would strand historical rows; only the label
+              -- changes. Rows from before the LLM was removed are still seconds,
+              -- which is exactly the before/after comparison you want.
+              AVG(gemma_ms)                 AS touchup,
               AVG(paste_ms)                 AS paste
        FROM sessions`
     )
@@ -138,7 +143,7 @@ function getMetrics() {
       timeToFirstPartialMs: round(stageRow.first_partial),
       releaseToPolishedMs: round(stageRow.release_to_polished),
       asrFinalizeMs: round(stageRow.asr_finalize),
-      gemmaMs: round(stageRow.gemma),
+      touchupMs: round(stageRow.touchup),
       pasteMs: round(stageRow.paste),
     },
     wpmTrend,

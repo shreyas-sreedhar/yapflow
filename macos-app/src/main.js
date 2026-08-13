@@ -26,6 +26,7 @@ const { DictationConnection } = require('./lib/wsClient');
 const {
   warmUp: warmUpInjectHelper,
   shutdown: shutdownInjectHelper,
+  injectViaClipboardPaste,
   typeIncrementalDelta,
   retractAndInject,
   getFrontmostAppBundleId,
@@ -191,13 +192,19 @@ async function syncInjectedText(target) {
   const retractCount = graphemeCount(injectedText.slice(prefixLength));
   const tail = target.slice(prefixLength);
 
+  // injectedText is updated after EACH step, not once at the end. If the second
+  // step throws — the helper died, a request timed out — a single trailing
+  // assignment would leave injectedText claiming text that is no longer at the
+  // cursor, and the next sync would retract more characters than we own, eating
+  // the user's surrounding text. Updating per step keeps it honest under failure.
   if (retractCount > 0) {
     await retractAndInject(retractCount, '');
+    injectedText = injectedText.slice(0, prefixLength);
   }
   if (tail) {
     await typeIncrementalDelta(tail);
+    injectedText += tail;
   }
-  injectedText = target;
 }
 
 /**
@@ -214,10 +221,18 @@ async function replaceInjectedText(finalText) {
   const retractCount = graphemeCount(injectedText.slice(prefixLength));
   const tail = finalText.slice(prefixLength);
 
-  if (retractCount > 0 || tail) {
-    await retractAndInject(retractCount, tail);
+  // Two separate steps, each followed by its own state update, for the same
+  // reason as syncInjectedText: a failure between them must not leave
+  // injectedText describing text that isn't at the cursor.
+  if (retractCount > 0) {
+    await retractAndInject(retractCount, '');
+    injectedText = injectedText.slice(0, prefixLength);
   }
-  injectedText = finalText;
+  if (tail) {
+    // Paste rather than keystrokes so the final text lands atomically.
+    await injectViaClipboardPaste(tail);
+    injectedText += tail;
+  }
 }
 
 /**
@@ -344,6 +359,12 @@ function setupConnection() {
 }
 
 function startDictation() {
+  // Retire any end-handshake still pending from the previous dictation before
+  // bumping the generation, so neither its timer nor a late 'capture-stopped'
+  // can end this one.
+  clearPendingEnd();
+  dictationGeneration++;
+
   // Starts the per-stage latency trace; the constructor stamps hotkeyDown
   // (≈ mic-start) immediately. See lib/timing.js.
   currentTimer = new DictationTimer();
@@ -385,13 +406,31 @@ function startDictation() {
 // in the renderer; it flushes that and then sends 'capture-stopped'. We wait for
 // that signal before telling the server the utterance is over, otherwise the
 // server can finalize before the tail of the last word arrives.
+//
+// The handshake is generation-tagged because it's asynchronous and the user can
+// press the hotkey again before it completes. Without the tag, releasing and
+// re-pressing inside the fallback window let the PREVIOUS dictation's pending
+// end — either the stale timer or a late 'capture-stopped' — send
+// end_of_utterance for the NEW dictation, cutting it off almost immediately.
+let dictationGeneration = 0;
+let pendingEndGeneration = null;
 let endUtteranceTimer = null;
 
-function sendEndUtterance() {
+function clearPendingEnd() {
   if (endUtteranceTimer) {
     clearTimeout(endUtteranceTimer);
     endUtteranceTimer = null;
   }
+  pendingEndGeneration = null;
+}
+
+/**
+ * Ends the utterance, but only if `generation` is still the one waiting to end.
+ * A mismatch means a newer dictation has started since, and this signal is stale.
+ */
+function sendEndUtterance(generation) {
+  if (generation === null || generation !== pendingEndGeneration) return;
+  clearPendingEnd();
   if (currentConnection) {
     currentConnection.endUtterance();
   }
@@ -402,13 +441,17 @@ function endDictation() {
   // release→text measure from the true release rather than from the handshake.
   if (currentTimer) currentTimer.markOnce('hotkeyUp');
 
+  const generation = dictationGeneration;
+  pendingEndGeneration = generation;
+
   // Fallback: if the renderer never reports back (capture failed to start, mic
   // permission denied, renderer crashed), still end the utterance rather than
-  // leaving the dictation hanging. The wait should normally be ~1ms.
+  // leaving the dictation hanging. Normally 'capture-stopped' beats this by
+  // ~1ms.
   endUtteranceTimer = setTimeout(() => {
-    console.warn('Renderer did not report capture-stopped; ending utterance anyway');
     endUtteranceTimer = null;
-    sendEndUtterance();
+    console.warn('Renderer did not report capture-stopped; ending utterance anyway');
+    sendEndUtterance(generation);
   }, 150);
 }
 
@@ -460,7 +503,9 @@ ipcMain.on('audio-chunk', (event, arrayBuffer) => {
 
 ipcMain.on('capture-stopped', () => {
   // The renderer has flushed its last audio frame; now it's safe to finalize.
-  sendEndUtterance();
+  // Applies to whichever dictation is currently waiting to end — if a new one
+  // has already started, pendingEndGeneration is null and this is a no-op.
+  sendEndUtterance(pendingEndGeneration);
 });
 
 ipcMain.on('renderer-error', (event, message) => {

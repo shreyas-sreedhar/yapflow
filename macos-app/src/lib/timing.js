@@ -1,18 +1,19 @@
 /**
  * Per-dictation latency instrumentation.
  *
- * Capture per-stage timestamps, not
- * just one end-to-end number, so a latency regression is attributable to a
- * specific stage (the bottleneck is far more often ASR finalization or
- * buffering than Gemma — only a per-stage trace makes that visible).
+ * Capture per-stage timestamps, not just one end-to-end number, so a latency
+ * regression is attributable to a specific stage. This has already earned its
+ * keep twice: it's how the Gemma 3 4B touch-up was identified as several seconds
+ * of the post-release path, and how clipboard injection was found to be ~375ms of
+ * process-spawn overhead. With both fixed, the remaining stages are ASR finalize
+ * (tens of ms) and paste (low tens); anything much larger is a regression.
  *
- * Clock-skew note: every mark here is taken on a SINGLE clock (the Mac's),
- * so the deltas between Mac marks are skew-free. Work done on the Jetson
- * (ASR finalize, Gemma) is NOT compared by absolute timestamp — it arrives
- * separately as DURATIONS in the 'polished' message (see wsClient.js /
- * jetson-server) and is merged into the summary by the caller. Comparing
- * cross-machine wall-clocks would be meaningless without clock sync we
- * deliberately don't have (single user, single device pair — no infra).
+ * Clock-skew note: every mark here is taken on a SINGLE clock (the Mac's), so
+ * deltas between Mac marks are skew-free. Work done on the Jetson (ASR finalize,
+ * touch-up) is NOT compared by absolute timestamp — it arrives separately as
+ * DURATIONS in the 'polished' message (see wsClient.js / jetson-server) and is
+ * merged into the summary by value. Comparing cross-machine wall-clocks would be
+ * meaningless without clock sync this deliberately doesn't require.
  */
 
 // The milestones we mark over a single dictation, in causal order. Each
@@ -64,17 +65,16 @@ class DictationTimer {
    * (e.g. no partials came back, or the connection dropped before paste)
    * yields null rather than a bogus number.
    *
-   * `jetson` is the optional `{ asrFinalizeMs, gemmaMs }` object from the
+   * `jetson` is the optional `{ asrFinalizeMs, touchupMs }` object from the
    * 'polished' message — passed through verbatim so the persisted record and
    * the log line carry the whole pipeline, not just the Mac half.
    */
   summary(jetson = {}) {
     return {
-      // Headline number §4 actually defines: hotkey-RELEASE to text appearing.
-      // (Measuring from press would fold in the user's speaking time, which
-      // is not latency — see the bug this replaced in main.js.)
+      // The headline number: hotkey-RELEASE to text appearing. Measuring from
+      // press would fold in the user's speaking time, which is not latency.
       releaseToTextMs: this._delta('hotkeyUp', 'pasteDone'),
-      // The user's actual speaking duration, for the WPM trend in §4.
+      // The user's actual speaking duration, for the WPM trend.
       speakingDurationMs: this._delta('hotkeyDown', 'hotkeyUp'),
       // Live-feedback responsiveness: audio-flowing to first words on screen.
       timeToFirstPartialMs: this._delta('firstChunkSent', 'firstPartial'),
@@ -84,13 +84,17 @@ class DictationTimer {
       pasteMs: this._delta('polishedReceived', 'pasteDone'),
       // Jetson-measured durations, merged in (null if not reported).
       asrFinalizeMs: jetson.asrFinalizeMs ?? null,
-      gemmaMs: jetson.gemmaMs ?? null,
+      // Was gemmaMs when the touch-up was a Gemma 3 4B call; it's now a
+      // deterministic pass, so expect well under 1ms here rather than seconds.
+      // Falls back to the old name so a server that predates the rename still
+      // reports.
+      touchupMs: jetson.touchupMs ?? jetson.gemmaMs ?? null,
     };
   }
 
   /**
-   * A single structured line for the dev console, so the latency trace
-   * exists from the very first run (per the log-driven-development rule).
+   * A single structured line for the dev console, so the latency trace exists
+   * from the very first run rather than only once the dashboard is opened.
    */
   logLine(jetson = {}) {
     const s = this.summary(jetson);
@@ -102,7 +106,7 @@ class DictationTimer {
       `release→polished=${fmt(s.releaseToPolishedMs)} ` +
       `paste=${fmt(s.pasteMs)} ` +
       `asrFinalize=${fmt(s.asrFinalizeMs)} ` +
-      `gemma=${fmt(s.gemmaMs)}`
+      `touchup=${fmt(s.touchupMs)}`
     );
   }
 }
