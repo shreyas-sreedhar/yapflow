@@ -37,6 +37,10 @@ let mediaStream = null;
 let workletNode = null;
 let sourceNode = null;
 let isCapturing = false;
+// True between the start of startCapture() and it going live. See startCapture.
+let isStarting = false;
+// Set if the hotkey is released while capture is still starting up.
+let wantStopped = false;
 // One-shot guard so the "first chunk" stage log fires once per capture rather
 // than on every audio frame. The authoritative per-stage trace lives in the main
 // process (lib/timing.js); these renderer logs just make the capture stage
@@ -156,8 +160,40 @@ function sendFrame(float32Frame) {
 }
 
 async function startCapture() {
-  if (isCapturing) return;
+  if (isCapturing || isStarting) return;
 
+  // `isCapturing` was only set at the END of this function, after two awaits. A
+  // hotkey tap shorter than getUserMedia + addModule — which is every tap on the
+  // first run, where a permission dialog is involved — meant stopCapture() saw
+  // isCapturing === false, returned early, and left the microphone live and
+  // streaming between dictations, indefinitely. `isStarting` closes that window:
+  // a release during startup sets wantStopped, and the tail of this function
+  // tears down instead of going live.
+  isStarting = true;
+  wantStopped = false;
+
+  try {
+    await beginCapture();
+  } catch (err) {
+    // Partial setup can leave a live mic behind — getUserMedia may have resolved
+    // before AudioContext or addModule failed. Release whatever was acquired
+    // before re-throwing to the caller's error handler.
+    isStarting = false;
+    isCapturing = true; // so releaseCaptureResources isn't skipped
+    stopCapture();
+    throw err;
+  } finally {
+    isStarting = false;
+  }
+
+  if (wantStopped) {
+    // Released before we finished starting. Tear straight back down.
+    isCapturing = true; // so stopCapture() doesn't early-return
+    stopCapture();
+  }
+}
+
+async function beginCapture() {
   mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: {
       channelCount: 1,
@@ -193,6 +229,12 @@ async function startCapture() {
 }
 
 function stopCapture() {
+  if (isStarting) {
+    // Still awaiting getUserMedia/addModule. Record the intent; startCapture's
+    // tail will tear down once it finishes, so the mic can't be left live.
+    wantStopped = true;
+    return;
+  }
   if (!isCapturing) return;
 
   // Flush before tearing anything down. Coalescing means up to ~20ms of audio is

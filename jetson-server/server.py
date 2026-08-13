@@ -338,11 +338,14 @@ async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) 
     session.signal_results_done()
     try:
         await asyncio.wait_for(forward_task, timeout=RESULT_DRAIN_TIMEOUT_SECONDS)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except asyncio.TimeoutError:
         # Bounded: a stuck send must not hold the dictation open.
         forward_task.cancel()
     except websockets.exceptions.ConnectionClosed:
         pass
+    # Deliberately NOT catching CancelledError here. It's a BaseException since
+    # 3.8 and means someone is shutting this coroutine down; swallowing it would
+    # let the utterance carry on past a cancellation request.
 
     if not raw_text.strip():
         # Very short utterance, or no speech detected. Must not error or hang —
@@ -406,7 +409,16 @@ def _warm_models() -> None:
     try:
         logger.info("Warming Moonshine model at startup...")
         get_transcriber()
+    except ValueError:
+        # A bad YAPFLOW_ASR_MODEL must kill the process, not be retried lazily.
+        # Swallowing it here meant the service started "successfully" and then
+        # failed every single dictation with a 1011 close — undoing the whole point
+        # of making the arch lookup strict, and making the unit file's claim that a
+        # typo is a hard error false.
+        raise
     except Exception:
+        # Anything else (a partial model download, transient disk error) is worth
+        # retrying on first use rather than refusing to start.
         logger.exception("Moonshine warm-up failed; will load lazily on first dictation")
 
 
