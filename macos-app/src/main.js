@@ -175,16 +175,24 @@ function commonPrefixLength(a, b) {
  * preserves order.
  */
 let injectionChain = Promise.resolve();
+
+/**
+ * Queues injection work behind whatever is already in flight.
+ *
+ * `generation` is the dictation the work belongs to; it's skipped if the user has
+ * since moved on. Without that check, a paste queued for utterance N could run
+ * after startDictation() reset injectedText for N+1, diff against "", and
+ * re-paste N's entire transcript at the new cursor — a few milliseconds wide, but
+ * visible garbage in the user's document.
+ *
+ * Pass `null` to mean "run unconditionally". That's for cleanup OF a superseded
+ * dictation (retracting its stranded partial text), which by definition executes
+ * after the generation has already moved on.
+ */
 function queueInjection(generation, work) {
   injectionChain = injectionChain
     .then(() => {
-      // Skip work belonging to a dictation the user has already moved past.
-      // Without this, a paste queued for utterance N could run after
-      // startDictation() reset injectedText for N+1, so it would diff against ""
-      // and re-paste N's entire transcript at the new cursor. The window is only
-      // a few milliseconds, but the result is visible garbage in the user's
-      // document, so it's worth the check.
-      if (generation !== dictationGeneration) return undefined;
+      if (generation !== null && generation !== dictationGeneration) return undefined;
       return work();
     })
     .catch((err) => {
@@ -383,10 +391,26 @@ function setupConnection() {
 }
 
 function startDictation() {
-  // Retire any end-handshake still pending from the previous dictation before
-  // bumping the generation, so neither its timer nor a late 'capture-stopped'
-  // can end this one.
-  clearPendingEnd();
+  // Close out the previous dictation before starting this one. This SENDS the
+  // outgoing end_of_utterance if it was still pending — see flushPendingEnd. Once
+  // flushed, neither its timer nor a late 'capture-stopped' can reach this
+  // dictation, because the generation no longer matches.
+  flushPendingEnd();
+
+  // Retract any partial text the previous dictation left at the cursor, so a
+  // re-press before its polished result arrived doesn't strand raw text in the
+  // document.
+  //
+  // Two details this has to get right. The retract count is captured NOW, because
+  // injectedText is reset below and the queued work would otherwise see '' and do
+  // nothing. And it's queued with generation null — meaning "always run" — because
+  // by the time it executes the generation has moved on, and the guard exists to
+  // skip work for a superseded dictation, not cleanup OF one.
+  const staleCount = graphemeCount(injectedText);
+  if (staleCount > 0) {
+    queueInjection(null, () => retractAndInject(staleCount, ''));
+  }
+
   dictationGeneration++;
 
   // Starts the per-stage latency trace; the constructor stamps hotkeyDown
@@ -425,12 +449,31 @@ function startDictation() {
   currentConnection.beginUtterance(knownTerms);
 }
 
-function clearPendingEnd() {
+/**
+ * Retires the pending end-of-utterance handshake, FLUSHING it rather than
+ * dropping it.
+ *
+ * Flushing is the important part. This used to just null the state, which meant a
+ * fast release-then-re-press cancelled the outgoing dictation's end entirely: its
+ * `end_of_utterance` was never sent, the server stayed inside that utterance, and
+ * the new dictation's audio fed the old stream — one merged transcript for two
+ * dictations, with the old raw partial text stranded in the document.
+ *
+ * The server also handles this from its side now (a `start_utterance` arriving
+ * mid-utterance ends the current one), but sending the end is still correct: it
+ * keeps the two sides in agreement instead of relying on the recovery path.
+ */
+function flushPendingEnd() {
   if (endUtteranceTimer) {
     clearTimeout(endUtteranceTimer);
     endUtteranceTimer = null;
   }
-  pendingEndGeneration = null;
+  if (pendingEndGeneration !== null) {
+    pendingEndGeneration = null;
+    if (currentConnection) {
+      currentConnection.endUtterance();
+    }
+  }
 }
 
 /**
@@ -439,10 +482,7 @@ function clearPendingEnd() {
  */
 function sendEndUtterance(generation) {
   if (generation === null || generation !== pendingEndGeneration) return;
-  clearPendingEnd();
-  if (currentConnection) {
-    currentConnection.endUtterance();
-  }
+  flushPendingEnd();
 }
 
 function endDictation() {

@@ -223,6 +223,45 @@ async def test_every_stream_is_freed_on_a_multi_utterance_connection():
     assert not leaked, f"streams {leaked} were never closed"
 
 
+async def test_start_utterance_mid_utterance_does_not_merge_dictations():
+    """
+    The merged-dictation bug. The Mac's end-of-utterance handshake is async, so a
+    fast release-then-re-press could skip end_of_utterance entirely. The server
+    then dropped the new start_utterance as "unrecognized", kept running the old
+    utterance, fed the new audio into the old stream, and returned ONE transcript
+    containing both dictations.
+
+    A start_utterance arriving mid-utterance now ends the current one implicitly.
+    """
+    async with websockets.serve(server._handle_session, HOST, PORT):
+        async with websockets.connect(URL) as ws:
+            await ws.send(json.dumps({"type": "hello"}))
+
+            # First dictation, deliberately never ended.
+            await ws.send(json.dumps({"type": "start_utterance"}))
+            for _ in range(20):
+                await ws.send(pcm_frame())
+            await asyncio.sleep(0.15)
+
+            # Second dictation opens without an intervening end_of_utterance.
+            await ws.send(json.dumps({"type": "start_utterance"}))
+            for _ in range(12):
+                await ws.send(pcm_frame())
+            await ws.send(json.dumps({"type": "end_of_utterance"}))
+
+            first, _ = await read_until(ws, "polished")
+            second, _ = await read_until(ws, "polished")
+
+    # Two separate transcripts, not one merged one.
+    assert first["polished_text"], f"first dictation lost: {first!r}"
+    assert second["polished_text"], f"second dictation lost: {second!r}"
+
+    # And two separate streams, each freed.
+    streams = asr.get_transcriber().streams
+    assert len(streams) == 2, f"expected 2 streams, got {len(streams)}"
+    assert all(s.closed for s in streams), "a stream was leaked"
+
+
 async def test_ping_pong_without_dictating():
     """Health check that doesn't require a dictation — used by the systemd probe."""
     async with websockets.serve(server._handle_session, HOST, PORT):

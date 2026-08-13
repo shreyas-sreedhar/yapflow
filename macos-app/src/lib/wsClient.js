@@ -278,12 +278,19 @@ class DictationConnection extends EventEmitter {
   /** Call on hotkey-release. */
   endUtterance() {
     if (!this._inUtterance) return;
+
     const sent = this._send({ type: 'end_of_utterance' });
+
+    // Either way the utterance is over from this side. Clearing the flag on the
+    // SENT path too matters: if the socket drops between end_of_utterance and the
+    // 'polished' reply, leaving it set made the reconnect handler open a phantom
+    // utterance that nothing would ever end — and the next real dictation's
+    // start_utterance would then land inside it.
+    this._inUtterance = false;
+
     if (!sent) {
-      // Socket is down, so no transcript is coming. Clear the flag so a later
-      // reconnect doesn't reopen a stale utterance, and drop the buffered audio
-      // for an utterance that can never be finalized.
-      this._inUtterance = false;
+      // Socket is down, so no transcript is coming. Drop the buffered audio for an
+      // utterance that can never be finalized.
       this._pendingChunks = [];
       this.emit('error', new Error('Jetson unreachable at end of dictation'));
     }

@@ -129,7 +129,9 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
     known_terms, legacy_single_shot = handshake
 
     if legacy_single_shot:
-        # An old client's "start" both authenticated and opened the utterance.
+        # An old client's "start" both authenticated and opened the utterance, and
+        # closes the connection afterwards — so a pending restart is meaningless
+        # here and is deliberately dropped.
         await _run_utterance(websocket, known_terms)
         return
 
@@ -154,9 +156,16 @@ async def _handle_session(websocket: WebSocketServerProtocol) -> None:
             if control_type == "start_utterance":
                 # Terms can be refreshed per utterance; the personal dictionary
                 # grows as the user corrects things.
-                if "known_terms" in control:
-                    known_terms = control.get("known_terms") or []
-                await _run_utterance(websocket, known_terms)
+                #
+                # Loop rather than a single call: _run_utterance returns a pending
+                # start_utterance when the client opened the next dictation before
+                # ending this one. Chaining here keeps them as separate utterances
+                # with separate transcripts, instead of merging them.
+                pending = control
+                while pending is not None:
+                    if "known_terms" in pending:
+                        known_terms = pending.get("known_terms") or []
+                    pending = await _run_utterance(websocket, known_terms)
             elif control_type == "ping":
                 await websocket.send(json.dumps({"type": "pong"}))
             elif control_type == "end_of_utterance":
@@ -216,17 +225,21 @@ async def _authenticate(websocket: WebSocketServerProtocol):
     return known_terms, msg_type == "start"
 
 
-async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) -> None:
+async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) -> "dict | None":
     """
     One dictation: feed audio until end_of_utterance, then finalize, touch up,
     and send the result back.
 
-    Returns normally when the utterance completes. Re-raises ConnectionClosed so
-    the caller's loop can exit — but only after finalizing, so the ASR stream is
-    never leaked.
+    Returns the `start_utterance` control message if the client opened a new
+    utterance before ending this one, so the caller can chain straight into it;
+    otherwise None. Re-raises ConnectionClosed so the caller's loop can exit — but
+    only after finalizing, so the ASR stream is never leaked.
     """
     session = StreamingSession()
     logger.info("Dictation session started")
+    # Set if the client opens a new utterance without ending this one; see the
+    # start_utterance branch in the loop below.
+    restart_requested = None
 
     async def _stream_results_to_client():
         """Forward Moonshine's partial/final results to the Mac as they arrive."""
@@ -266,6 +279,21 @@ async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) 
 
             control_type = control.get("type")
             if control_type == "end_of_utterance":
+                break
+            elif control_type == "start_utterance":
+                # A new utterance opening while this one is still running means
+                # the client's end_of_utterance never arrived — it races its own
+                # asynchronous end-of-capture handshake, so a fast
+                # release-then-re-press can skip it.
+                #
+                # Treat it as an implicit end. Dropping it as "unrecognized",
+                # which is what used to happen, silently MERGED the two
+                # dictations: this loop kept running, the new audio fed this
+                # stream, and one transcript came back containing both. Ending
+                # here keeps them separate; the caller's loop then starts the new
+                # one normally.
+                logger.info("start_utterance during an utterance — ending the current one")
+                restart_requested = control
                 break
             elif control_type == "ping":
                 await websocket.send(json.dumps({"type": "pong"}))
@@ -331,7 +359,7 @@ async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) 
             )
         )
         logger.info("Dictation session ended with no speech detected")
-        return
+        return restart_requested
 
     touchup_ms = None
     try:
@@ -358,6 +386,7 @@ async def _run_utterance(websocket: WebSocketServerProtocol, known_terms: list) 
     logger.info(
         "Dictation session complete (asr_finalize=%sms, touchup=%sms)", asr_finalize_ms, touchup_ms
     )
+    return restart_requested
 
 
 def _warm_models() -> None:
